@@ -1,0 +1,758 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🧠🎵 EEG Music Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1600px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 20px; font-size: 2em; }
+        h1 span { font-size: 0.5em; opacity: 0.7; display: block; }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+        }
+        
+        .card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 16px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .card h2 {
+            font-size: 1.1em;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ff4444;
+        }
+        .status.connected { background: #44ff44; }
+        .status.generating { background: #ffaa00; animation: pulse 1s infinite; }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.7; transform: scale(1.2); }
+        }
+        
+        .band-bar {
+            display: flex;
+            align-items: center;
+            margin: 8px 0;
+            gap: 10px;
+        }
+        .band-label { width: 70px; font-size: 0.85em; }
+        .band-track {
+            flex: 1;
+            height: 20px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .band-fill {
+            height: 100%;
+            border-radius: 10px;
+            transition: width 0.3s ease;
+        }
+        .band-value { width: 45px; text-align: right; font-family: monospace; font-size: 0.85em; }
+        
+        .delta .band-fill { background: linear-gradient(90deg, #9b59b6, #8e44ad); }
+        .theta .band-fill { background: linear-gradient(90deg, #3498db, #2980b9); }
+        .alpha .band-fill { background: linear-gradient(90deg, #2ecc71, #27ae60); }
+        .beta .band-fill { background: linear-gradient(90deg, #f1c40f, #f39c12); }
+        .gamma .band-fill { background: linear-gradient(90deg, #e74c3c, #c0392b); }
+        
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+        }
+        .metric {
+            text-align: center;
+            padding: 12px 8px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 10px;
+        }
+        .metric-value { font-size: 1.5em; font-weight: bold; margin: 3px 0; }
+        .metric-label { opacity: 0.7; font-size: 0.8em; }
+        
+        .music-controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            transition: all 0.2s;
+            flex: 1;
+        }
+        button:hover { transform: scale(1.02); }
+        button:active { transform: scale(0.98); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+        
+        .btn-start { background: linear-gradient(135deg, #2ecc71, #27ae60); color: white; }
+        .btn-stop { background: linear-gradient(135deg, #e74c3c, #c0392b); color: white; }
+        .btn-reset { background: rgba(255,255,255,0.2); color: white; }
+        
+        .music-status {
+            background: rgba(0,0,0,0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        
+        .music-param {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        .music-param:last-child { border-bottom: none; }
+        .param-label { opacity: 0.7; }
+        .param-value { font-weight: bold; font-family: monospace; }
+        
+        .prompt-display {
+            background: rgba(52, 152, 219, 0.2);
+            border: 1px solid rgba(52, 152, 219, 0.4);
+            border-radius: 10px;
+            padding: 12px;
+            margin-top: 10px;
+            font-style: italic;
+            font-size: 0.9em;
+        }
+        
+        .buffer-progress {
+            height: 6px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 3px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        .buffer-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3498db, #2ecc71);
+            transition: width 0.3s;
+        }
+        
+        .state-indicator {
+            text-align: center;
+            padding: 20px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+        }
+        .state-emoji { font-size: 2.5em; display: block; margin-bottom: 8px; }
+        
+        .chart-container { height: 150px; margin-top: 10px; }
+        
+        .log-container {
+            max-height: 150px;
+            overflow-y: auto;
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 0.8em;
+        }
+        .log-entry { padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .log-time { color: #888; }
+        .log-change { color: #f1c40f; }
+        
+        .slider-group { display: flex; flex-direction: column; gap: 8px; }
+        .slider-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .slider-label { width: 80px; font-size: 0.9em; }
+        .slider-value { width: 45px; text-align: right; font-family: monospace; font-size: 0.85em; }
+        input[type="range"] {
+            flex: 1;
+            height: 6px;
+            -webkit-appearance: none;
+            background: rgba(255,255,255,0.2);
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            background: #3498db;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        input[type="range"]::-webkit-slider-thumb:hover {
+            background: #2980b9;
+            transform: scale(1.1);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🧠🎵 EEG Music Dashboard <span>Brain-controlled music generation</span></h1>
+        
+        <div class="grid">
+            <!-- EEG Bands -->
+            <div class="card">
+                <h2><span class="status" id="eeg-status"></span> EEG Bands</h2>
+                
+                <div class="band-bar delta">
+                    <span class="band-label">δ Delta</span>
+                    <div class="band-track"><div class="band-fill" id="delta-bar"></div></div>
+                    <span class="band-value" id="delta-val">0.00</span>
+                </div>
+                <div class="band-bar theta">
+                    <span class="band-label">θ Theta</span>
+                    <div class="band-track"><div class="band-fill" id="theta-bar"></div></div>
+                    <span class="band-value" id="theta-val">0.00</span>
+                </div>
+                <div class="band-bar alpha">
+                    <span class="band-label">α Alpha</span>
+                    <div class="band-track"><div class="band-fill" id="alpha-bar"></div></div>
+                    <span class="band-value" id="alpha-val">0.00</span>
+                </div>
+                <div class="band-bar beta">
+                    <span class="band-label">β Beta</span>
+                    <div class="band-track"><div class="band-fill" id="beta-bar"></div></div>
+                    <span class="band-value" id="beta-val">0.00</span>
+                </div>
+                <div class="band-bar gamma">
+                    <span class="band-label">γ Gamma</span>
+                    <div class="band-track"><div class="band-fill" id="gamma-bar"></div></div>
+                    <span class="band-value" id="gamma-val">0.00</span>
+                </div>
+                
+                <div class="chart-container">
+                    <canvas id="bandChart"></canvas>
+                </div>
+            </div>
+            
+            <!-- Metrics -->
+            <div class="card">
+                <h2>🎯 Brain State</h2>
+                
+                <div class="metric-grid">
+                    <div class="metric">
+                        <div class="metric-label">Arousal</div>
+                        <div class="metric-value" id="arousal-val" style="color:#e74c3c">0.00</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Valence</div>
+                        <div class="metric-value" id="valence-val" style="color:#2ecc71">0.00</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Focus</div>
+                        <div class="metric-value" id="focus-val" style="color:#f1c40f">0.00</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Relaxation</div>
+                        <div class="metric-value" id="relax-val" style="color:#3498db">0.00</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Dominant</div>
+                        <div class="metric-value" id="dominant-val" style="color:#9b59b6">α</div>
+                    </div>
+                    <div class="metric">
+                        <div class="metric-label">Change</div>
+                        <div class="metric-value" id="change-val">-</div>
+                    </div>
+                </div>
+                
+                <div class="state-indicator">
+                    <span class="state-emoji" id="state-emoji">🧘</span>
+                    <span id="state-text">Connecting...</span>
+                </div>
+            </div>
+            
+            <!-- Music Controls -->
+            <div class="card">
+                <h2><span class="status" id="music-status"></span> Music Control</h2>
+                
+                <div class="music-controls">
+                    <button class="btn-start" id="btn-start" onclick="startMusic()">▶️ Start Music</button>
+                    <button class="btn-stop" id="btn-stop" onclick="stopMusic()" disabled>⏹️ Stop</button>
+                </div>
+                
+                <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:15px;">🔄 Reset Baseline</button>
+                
+                <div class="music-status">
+                    <div class="music-param">
+                        <span class="param-label">Status</span>
+                        <span class="param-value" id="gen-status">Stopped</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Time</span>
+                        <span class="param-value" id="gen-time">0:00</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Buffer</span>
+                        <span class="param-value" id="buffer-status">0%</span>
+                    </div>
+                    <div class="buffer-progress">
+                        <div class="buffer-fill" id="buffer-bar" style="width: 0%"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Music Parameters -->
+            <div class="card">
+                <h2>🎛️ Music Parameters</h2>
+                
+                <div class="music-status">
+                    <div class="music-param">
+                        <span class="param-label">BPM</span>
+                        <span class="param-value" id="param-bpm">80</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Scale</span>
+                        <span class="param-value" id="param-scale">C Major</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Density</span>
+                        <span class="param-value" id="param-density">0.50</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Brightness</span>
+                        <span class="param-value" id="param-brightness">0.50</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Drums</span>
+                        <span class="param-value" id="param-drums">ON</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Bass</span>
+                        <span class="param-value" id="param-bass">ON</span>
+                    </div>
+                </div>
+                
+                <div class="prompt-display" id="current-prompt">
+                    Waiting to start...
+                </div>
+            </div>
+            
+            <!-- Sensitivity Controls -->
+            <div class="card">
+                <h2>🎚️ Band Sensitivity</h2>
+                <p style="opacity:0.7; font-size:0.85em; margin-bottom:15px;">Adjust how much each band affects the music</p>
+                
+                <div class="slider-group">
+                    <div class="slider-row">
+                        <span class="slider-label" style="color:#9b59b6">δ Delta</span>
+                        <input type="range" min="0" max="300" value="100" id="sens-delta" oninput="updateSensitivity()">
+                        <span class="slider-value" id="sens-delta-val">1.0x</span>
+                    </div>
+                    <div class="slider-row">
+                        <span class="slider-label" style="color:#3498db">θ Theta</span>
+                        <input type="range" min="0" max="300" value="100" id="sens-theta" oninput="updateSensitivity()">
+                        <span class="slider-value" id="sens-theta-val">1.0x</span>
+                    </div>
+                    <div class="slider-row">
+                        <span class="slider-label" style="color:#2ecc71">α Alpha</span>
+                        <input type="range" min="0" max="300" value="100" id="sens-alpha" oninput="updateSensitivity()">
+                        <span class="slider-value" id="sens-alpha-val">1.0x</span>
+                    </div>
+                    <div class="slider-row">
+                        <span class="slider-label" style="color:#f1c40f">β Beta</span>
+                        <input type="range" min="0" max="300" value="100" id="sens-beta" oninput="updateSensitivity()">
+                        <span class="slider-value" id="sens-beta-val">1.0x</span>
+                    </div>
+                    <div class="slider-row">
+                        <span class="slider-label" style="color:#e74c3c">γ Gamma</span>
+                        <input type="range" min="0" max="300" value="100" id="sens-gamma" oninput="updateSensitivity()">
+                        <span class="slider-value" id="sens-gamma-val">1.0x</span>
+                    </div>
+                </div>
+                
+                <div style="margin-top:20px; padding-top:15px; border-top:1px solid rgba(255,255,255,0.1);">
+                    <h3 style="font-size:1em; margin-bottom:10px;">⚖️ Stability</h3>
+                    <div class="slider-row">
+                        <span class="slider-label">Smoothing</span>
+                        <input type="range" min="1" max="20" value="5" id="smoothing" oninput="updateSensitivity()">
+                        <span class="slider-value" id="smoothing-val">5</span>
+                    </div>
+                    <div class="slider-row">
+                        <span class="slider-label">Global Sens.</span>
+                        <input type="range" min="50" max="500" value="250" id="global-sens" oninput="updateSensitivity()">
+                        <span class="slider-value" id="global-sens-val">2.5x</span>
+                    </div>
+                </div>
+                
+                <button class="btn-secondary" onclick="resetSliders()" style="width:100%; margin-top:15px;">↺ Reset to Default</button>
+            </div>
+            
+            <!-- Log -->
+            <div class="card">
+                <h2>📋 Activity Log</h2>
+                <div class="log-container" id="log-container"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let ws;
+        let isGenerating = false;
+        let startTime = null;
+        let bandHistory = { delta: [], theta: [], alpha: [], beta: [], gamma: [] };
+        const maxHistory = 60;
+        
+        // Chart
+        const ctx = document.getElementById('bandChart').getContext('2d');
+        const bandChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: Array(maxHistory).fill(''),
+                datasets: [
+                    { label: 'Delta', data: [], borderColor: '#9b59b6', tension: 0.4, pointRadius: 0, borderWidth: 2 },
+                    { label: 'Theta', data: [], borderColor: '#3498db', tension: 0.4, pointRadius: 0, borderWidth: 2 },
+                    { label: 'Alpha', data: [], borderColor: '#2ecc71', tension: 0.4, pointRadius: 0, borderWidth: 2 },
+                    { label: 'Beta', data: [], borderColor: '#f1c40f', tension: 0.4, pointRadius: 0, borderWidth: 2 },
+                    { label: 'Gamma', data: [], borderColor: '#e74c3c', tension: 0.4, pointRadius: 0, borderWidth: 2 },
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: { min: 0, max: 0.6, grid: { color: 'rgba(255,255,255,0.1)' }, ticks: { color: '#888' } },
+                    x: { display: false }
+                },
+                plugins: { legend: { display: false } }
+            }
+        });
+        
+        function connect() {
+            ws = new WebSocket('ws://localhost:8767');
+            
+            ws.onopen = () => {
+                document.getElementById('eeg-status').classList.add('connected');
+                addLog('Conectado al servidor');
+            };
+            
+            ws.onclose = () => {
+                document.getElementById('eeg-status').classList.remove('connected');
+                addLog('Desconectado - reconectando...');
+                setTimeout(connect, 2000);
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'eeg') {
+                    updateEEG(data);
+                } else if (data.type === 'audio') {
+                    handleAudioChunk(data);
+                } else if (data.type === 'music_status') {
+                    updateMusicStatus(data);
+                } else if (data.type === 'music_started') {
+                    isGenerating = true;
+                    startTime = Date.now();
+                    initAudio();
+                    document.getElementById('btn-start').disabled = true;
+                    document.getElementById('btn-stop').disabled = false;
+                    document.getElementById('music-status').classList.add('generating');
+                    document.getElementById('gen-status').textContent = 'Buffering...';
+                    addLog('🎵 Music started - buffering audio...', 'change');
+                } else if (data.type === 'music_stopped') {
+                    isGenerating = false;
+                    stopAudio();
+                    document.getElementById('btn-start').disabled = false;
+                    document.getElementById('btn-stop').disabled = true;
+                    document.getElementById('music-status').classList.remove('generating');
+                    document.getElementById('gen-status').textContent = 'Stopped';
+                    if (data.file) {
+                        addLog('💾 Audio saved: ' + data.file, 'change');
+                    }
+                } else if (data.type === 'log') {
+                    addLog(data.message, data.level);
+                }
+            };
+        }
+        
+        function updateEEG(data) {
+            const bands = data.bands;
+            const metrics = data.metrics;
+            const music = data.music_params;
+            
+            // Bands
+            for (const band of ['delta', 'theta', 'alpha', 'beta', 'gamma']) {
+                const val = bands[band] || 0;
+                document.getElementById(`${band}-bar`).style.width = `${val * 100}%`;
+                document.getElementById(`${band}-val`).textContent = val.toFixed(2);
+                bandHistory[band].push(val);
+                if (bandHistory[band].length > maxHistory) bandHistory[band].shift();
+            }
+            
+            // Chart
+            bandChart.data.datasets[0].data = bandHistory.delta;
+            bandChart.data.datasets[1].data = bandHistory.theta;
+            bandChart.data.datasets[2].data = bandHistory.alpha;
+            bandChart.data.datasets[3].data = bandHistory.beta;
+            bandChart.data.datasets[4].data = bandHistory.gamma;
+            bandChart.update('none');
+            
+            // Metrics
+            const adj_a = metrics.arousal_adjusted || metrics.arousal;
+            const adj_v = metrics.valence_adjusted || metrics.valence;
+            document.getElementById('arousal-val').textContent = adj_a.toFixed(2);
+            document.getElementById('valence-val').textContent = adj_v.toFixed(2);
+            document.getElementById('focus-val').textContent = (metrics.focus_adjusted || metrics.focus).toFixed(2);
+            document.getElementById('relax-val').textContent = (metrics.relaxation_adjusted || metrics.relaxation).toFixed(2);
+            
+            // Dominant band
+            const bandMap = {delta: 'δ', theta: 'θ', alpha: 'α', beta: 'β', gamma: 'γ'};
+            const dominant = Object.keys(bands).reduce((a, b) => bands[a] > bands[b] ? a : b);
+            document.getElementById('dominant-val').textContent = bandMap[dominant];
+            
+            // Change indicator
+            document.getElementById('change-val').textContent = metrics.significant_change ? '🔄' : '-';
+            
+            // State
+            updateState(metrics);
+            
+            // Music params
+            if (music) {
+                document.getElementById('param-bpm').textContent = music.bpm;
+                document.getElementById('param-scale').textContent = formatScale(music.scale);
+                document.getElementById('param-density').textContent = music.density.toFixed(2);
+                document.getElementById('param-brightness').textContent = music.brightness.toFixed(2);
+                document.getElementById('param-drums').textContent = music.mute_drums ? 'OFF' : 'ON';
+                document.getElementById('param-bass').textContent = music.mute_bass ? 'OFF' : 'ON';
+            }
+            
+            if (data.prompt) {
+                document.getElementById('current-prompt').textContent = data.prompt;
+            }
+        }
+        
+        function updateMusicStatus(data) {
+            document.getElementById('buffer-status').textContent = data.buffer_progress.toFixed(0) + '%';
+            document.getElementById('buffer-bar').style.width = data.buffer_progress + '%';
+            
+            if (data.buffer_ready) {
+                document.getElementById('gen-status').textContent = '🔊 Playing';
+            }
+        }
+        
+        function updateState(metrics) {
+            const relax = metrics.relaxation_adjusted || metrics.relaxation;
+            const focus = metrics.focus_adjusted || metrics.focus;
+            const arousal = metrics.arousal_adjusted || metrics.arousal;
+            
+            let emoji = '🧘', text = 'Neutral';
+            
+            if (relax > 0.6) { emoji = '😌'; text = 'Relaxed'; }
+            else if (focus > 0.6) { emoji = '🎯'; text = 'Focused'; }
+            else if (arousal > 0.7) { emoji = '⚡'; text = 'High Energy'; }
+            else if (arousal < 0.2) { emoji = '😴'; text = 'Low Energy'; }
+            
+            document.getElementById('state-emoji').textContent = emoji;
+            document.getElementById('state-text').textContent = text;
+        }
+        
+        function formatScale(scale) {
+            const map = {
+                'C_MAJOR_A_MINOR': 'C Major',
+                'D_MAJOR_B_MINOR': 'D Major',
+                'G_MAJOR_E_MINOR': 'G Major',
+                'F_MAJOR_D_MINOR': 'F Major',
+                'A_MAJOR_G_FLAT_MINOR': 'A Major',
+                'E_FLAT_MAJOR_C_MINOR': 'E♭ Major',
+                'B_FLAT_MAJOR_G_MINOR': 'B♭ Major',
+                'A_FLAT_MAJOR_F_MINOR': 'A♭ Major'
+            };
+            return map[scale] || scale;
+        }
+        
+        function startMusic() {
+            ws.send(JSON.stringify({ action: 'start_music' }));
+            addLog('Starting music generation...');
+        }
+        
+        function stopMusic() {
+            ws.send(JSON.stringify({ action: 'stop_music' }));
+            addLog('Stopping music...');
+        }
+        
+        function resetBaseline() {
+            ws.send(JSON.stringify({ action: 'reset_baseline' }));
+            addLog('🔄 Resetting baseline...', 'change');
+        }
+        
+        // ============ SENSITIVITY CONTROLS ============
+        function updateSensitivity() {
+            const settings = {
+                band_sensitivity: {
+                    delta: document.getElementById('sens-delta').value / 100,
+                    theta: document.getElementById('sens-theta').value / 100,
+                    alpha: document.getElementById('sens-alpha').value / 100,
+                    beta: document.getElementById('sens-beta').value / 100,
+                    gamma: document.getElementById('sens-gamma').value / 100
+                },
+                smoothing: parseInt(document.getElementById('smoothing').value),
+                global_sensitivity: document.getElementById('global-sens').value / 100
+            };
+            
+            // Update display values
+            document.getElementById('sens-delta-val').textContent = settings.band_sensitivity.delta.toFixed(1) + 'x';
+            document.getElementById('sens-theta-val').textContent = settings.band_sensitivity.theta.toFixed(1) + 'x';
+            document.getElementById('sens-alpha-val').textContent = settings.band_sensitivity.alpha.toFixed(1) + 'x';
+            document.getElementById('sens-beta-val').textContent = settings.band_sensitivity.beta.toFixed(1) + 'x';
+            document.getElementById('sens-gamma-val').textContent = settings.band_sensitivity.gamma.toFixed(1) + 'x';
+            document.getElementById('smoothing-val').textContent = settings.smoothing;
+            document.getElementById('global-sens-val').textContent = settings.global_sensitivity.toFixed(1) + 'x';
+            
+            // Send to server
+            ws.send(JSON.stringify({ action: 'update_settings', settings: settings }));
+        }
+        
+        function resetSliders() {
+            document.getElementById('sens-delta').value = 100;
+            document.getElementById('sens-theta').value = 100;
+            document.getElementById('sens-alpha').value = 100;
+            document.getElementById('sens-beta').value = 100;
+            document.getElementById('sens-gamma').value = 100;
+            document.getElementById('smoothing').value = 5;
+            document.getElementById('global-sens').value = 250;
+            updateSensitivity();
+            addLog('↺ Sliders reset to default');
+        }
+        
+        function addLog(message, level = '') {
+            const container = document.getElementById('log-container');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = 'log-entry' + (level === 'change' ? ' log-change' : '');
+            entry.innerHTML = `<span class="log-time">[${time}]</span> ${message}`;
+            container.appendChild(entry);
+            container.scrollTop = container.scrollHeight;
+        }
+        
+        // Update time
+        setInterval(() => {
+            if (isGenerating && startTime) {
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                const mins = Math.floor(elapsed / 60);
+                const secs = elapsed % 60;
+                document.getElementById('gen-time').textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+            }
+        }, 1000);
+        
+        // ============ WEB AUDIO API FOR PLAYBACK ============
+        let audioContext = null;
+        let audioQueue = [];
+        let isPlaying = false;
+        let nextPlayTime = 0;
+        const BUFFER_SECONDS = 5; // Buffer before starting playback
+        let totalBufferedSeconds = 0;
+        let playbackStarted = false;
+        
+        function initAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 48000
+                });
+                addLog('🔊 Audio initialized');
+            }
+            if (audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+        }
+        
+        function handleAudioChunk(data) {
+            if (!audioContext) initAudio();
+            
+            // Decode base64 to ArrayBuffer
+            const binaryString = atob(data.data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            // Convert Int16 PCM to Float32
+            const int16Array = new Int16Array(bytes.buffer);
+            const float32Array = new Float32Array(int16Array.length);
+            for (let i = 0; i < int16Array.length; i++) {
+                float32Array[i] = int16Array[i] / 32768.0;
+            }
+            
+            // Create audio buffer (stereo)
+            const numSamples = float32Array.length / 2;
+            const audioBuffer = audioContext.createBuffer(2, numSamples, 48000);
+            
+            // Deinterleave stereo channels
+            const leftChannel = audioBuffer.getChannelData(0);
+            const rightChannel = audioBuffer.getChannelData(1);
+            for (let i = 0; i < numSamples; i++) {
+                leftChannel[i] = float32Array[i * 2];
+                rightChannel[i] = float32Array[i * 2 + 1];
+            }
+            
+            // Add to queue
+            audioQueue.push(audioBuffer);
+            totalBufferedSeconds += audioBuffer.duration;
+            
+            // Start playback after buffering enough
+            if (!playbackStarted && totalBufferedSeconds >= BUFFER_SECONDS) {
+                playbackStarted = true;
+                nextPlayTime = audioContext.currentTime + 0.1;
+                scheduleBuffers();
+                addLog('🔊 Playback started!', 'change');
+            }
+        }
+        
+        function scheduleBuffers() {
+            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + 2) {
+                const buffer = audioQueue.shift();
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+                source.start(nextPlayTime);
+                nextPlayTime += buffer.duration;
+            }
+            
+            if (isGenerating || audioQueue.length > 0) {
+                setTimeout(scheduleBuffers, 100);
+            }
+        }
+        
+        function stopAudio() {
+            audioQueue = [];
+            playbackStarted = false;
+            totalBufferedSeconds = 0;
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+        }
+        
+        connect();
+    </script>
+</body>
+</html>
