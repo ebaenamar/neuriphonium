@@ -15,6 +15,7 @@ from collections import deque
 from dotenv import load_dotenv
 import logging
 import threading
+from audio_pitch_tracker import AudioPitchTracker
 
 load_dotenv()
 
@@ -38,7 +39,7 @@ EEG_BANDS = {
 
 
 class EEGProcessor:
-    """Procesador de señales EEG con detección de cambios y sensibilidad configurable"""
+    """EEG signal processor with calibration-based mapping and per-band sensitivity"""
     
     def __init__(self, sensitivity=2.5):
         self.smoothing = 3
@@ -49,17 +50,20 @@ class EEGProcessor:
         self.baseline_samples = []
         self.current_style_idx = 0
         
-        # Sensibilidad por banda (configurable desde UI)
+        # Per-band sensitivity (configurable from UI)
         self.band_sensitivity = {
-            'delta': 1.0,
-            'theta': 1.0,
-            'alpha': 1.0,
-            'beta': 1.0,
-            'gamma': 1.0
+            'delta': 1.0, 'theta': 1.0, 'alpha': 1.0, 'beta': 1.0, 'gamma': 1.0
         }
+        
+        # Calibration data: stores band stats from baseline recording
+        self.is_calibrating = False
+        self.calibration_data = []  # list of band dicts during calibration
+        self.calibration_stats = None  # {band: {min, max, mean, std}} after calibration
+        self.calibration_duration = 30  # seconds
+        self.calibration_start = None
     
     def update_settings(self, settings: dict):
-        """Actualizar configuración desde la UI"""
+        """Update configuration from UI"""
         if 'band_sensitivity' in settings:
             self.band_sensitivity.update(settings['band_sensitivity'])
         if 'smoothing' in settings:
@@ -69,6 +73,74 @@ class EEGProcessor:
                 self.band_history = {band: deque(maxlen=self.smoothing) for band in EEG_BANDS}
         if 'global_sensitivity' in settings:
             self.sensitivity = settings['global_sensitivity']
+    
+    def start_calibration(self, duration=30):
+        """Start baseline calibration recording"""
+        self.is_calibrating = True
+        self.calibration_data = []
+        self.calibration_duration = duration
+        self.calibration_start = time.time()
+        self.calibration_stats = None
+        logger.info(f"📊 Calibration started ({duration}s)...")
+    
+    def finish_calibration(self):
+        """Finish calibration and compute stats"""
+        self.is_calibrating = False
+        if len(self.calibration_data) < 5:
+            logger.warning("Not enough calibration data")
+            return None
+        
+        stats = {}
+        for band in EEG_BANDS:
+            values = [d[band] for d in self.calibration_data]
+            stats[band] = {
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)),
+                'p10': float(np.percentile(values, 10)),
+                'p90': float(np.percentile(values, 90)),
+            }
+        
+        # Also compute metric stats
+        for metric_name in ['arousal', 'valence', 'focus', 'relaxation']:
+            values = [d.get(metric_name, 0) for d in self.calibration_data if metric_name in d]
+            if values:
+                stats[metric_name] = {
+                    'min': float(np.min(values)),
+                    'max': float(np.max(values)),
+                    'mean': float(np.mean(values)),
+                    'std': float(np.std(values)),
+                    'p10': float(np.percentile(values, 10)),
+                    'p90': float(np.percentile(values, 90)),
+                }
+        
+        self.calibration_stats = stats
+        logger.info(f"📊 Calibration complete! {len(self.calibration_data)} samples")
+        for band in EEG_BANDS:
+            s = stats[band]
+            logger.info(f"  {band}: mean={s['mean']:.4f} std={s['std']:.4f} range=[{s['p10']:.4f}, {s['p90']:.4f}]")
+        for m in ['arousal', 'valence', 'focus', 'relaxation']:
+            if m in stats:
+                s = stats[m]
+                logger.info(f"  {m}: mean={s['mean']:.4f} std={s['std']:.4f} range=[{s['p10']:.4f}, {s['p90']:.4f}]")
+        
+        return stats
+    
+    def _normalize_band(self, band_name, raw_value):
+        """Normalize a band value using calibration stats to 0-1 range"""
+        if not self.calibration_stats or band_name not in self.calibration_stats:
+            return raw_value
+        
+        s = self.calibration_stats[band_name]
+        # Use p10-p90 range for normalization (robust to outliers)
+        range_low = s['p10']
+        range_high = s['p90']
+        if range_high - range_low < 0.001:
+            return 0.5
+        
+        normalized = (raw_value - range_low) / (range_high - range_low)
+        return float(np.clip(normalized, 0, 1))
     
     def extract_bands(self, eeg_data: np.ndarray) -> dict:
         if eeg_data.ndim == 1:
@@ -89,7 +161,7 @@ class EEGProcessor:
         if total > 0:
             band_powers = {k: v / total for k, v in band_powers.items()}
         
-        # Aplicar sensibilidad por banda
+        # Apply per-band sensitivity + smoothing
         for band, power in band_powers.items():
             adjusted_power = power * self.band_sensitivity.get(band, 1.0)
             self.band_history[band].append(adjusted_power)
@@ -107,8 +179,17 @@ class EEGProcessor:
         
         metrics = {'arousal': arousal, 'valence': valence, 'focus': focus, 'relaxation': relaxation, **bands}
         
-        # Baseline
-        if self.baseline_metrics is None:
+        # Store calibration data if calibrating
+        if self.is_calibrating:
+            self.calibration_data.append(metrics.copy())
+            elapsed = time.time() - self.calibration_start if self.calibration_start else 0
+            metrics['calibration_progress'] = min(100, (elapsed / self.calibration_duration) * 100)
+            if elapsed >= self.calibration_duration:
+                self.finish_calibration()
+                metrics['calibration_complete'] = True
+        
+        # Auto-baseline (first 5 samples if no calibration)
+        if self.baseline_metrics is None and not self.calibration_stats:
             self.baseline_samples.append(metrics.copy())
             if len(self.baseline_samples) >= 5:
                 self.baseline_metrics = {
@@ -116,58 +197,117 @@ class EEGProcessor:
                     for k in ['arousal', 'valence', 'focus', 'relaxation']
                 }
         
-        # Cambios relativos
-        if self.baseline_metrics:
+        # Apply calibration-based normalization if available
+        if self.calibration_stats:
             for key in ['arousal', 'valence', 'focus', 'relaxation']:
-                delta = metrics[key] - self.baseline_metrics[key]
+                metrics[f'{key}_adjusted'] = self._normalize_band(key, metrics[key])
+            for band in EEG_BANDS:
+                metrics[f'{band}_norm'] = self._normalize_band(band, bands.get(band, 0))
+        elif self.baseline_metrics:
+            for key in ['arousal', 'valence', 'focus', 'relaxation']:
+                delta_val = metrics[key] - self.baseline_metrics[key]
                 metrics[f'{key}_adjusted'] = np.clip(
-                    self.baseline_metrics[key] + delta * self.sensitivity, 0, 1
+                    self.baseline_metrics[key] + delta_val * self.sensitivity, 0, 1
                 )
         
-        # Detectar cambios
+        # Detect significant changes
         metrics['significant_change'] = False
         if self.prev_metrics:
             for key in ['arousal', 'valence']:
-                if abs(metrics[key] - self.prev_metrics[key]) > 0.05:
+                if abs(metrics[key] - self.prev_metrics[key]) > 0.03:
                     metrics['significant_change'] = True
                     break
         
         self.prev_metrics = metrics.copy()
         return metrics
     
-    def map_to_lyria(self, bands: dict, metrics: dict) -> dict:
+    def map_to_lyria(self, bands: dict, metrics: dict, audio_scale=None) -> dict:
+        """
+        Map EEG bands and metrics to Lyria parameters
+        
+        Args:
+            bands: EEG band powers
+            metrics: Cognitive metrics (arousal, valence, focus, relaxation)
+            audio_scale: Optional scale from audio input (violin) - overrides EEG-based scale
+        """
         arousal = metrics.get('arousal_adjusted', metrics['arousal'])
         valence = metrics.get('valence_adjusted', metrics['valence'])
         focus = metrics.get('focus_adjusted', metrics['focus'])
         relaxation = metrics.get('relaxation_adjusted', metrics['relaxation'])
         
-        delta = bands.get('delta', 0.2)
-        theta = bands.get('theta', 0.2)
-        gamma = bands.get('gamma', 0.2)
+        # Use normalized bands if calibrated, otherwise raw
+        delta = metrics.get('delta_norm', bands.get('delta', 0.2))
+        theta = metrics.get('theta_norm', bands.get('theta', 0.2))
+        alpha = metrics.get('alpha_norm', bands.get('alpha', 0.2))
+        beta = metrics.get('beta_norm', bands.get('beta', 0.2))
+        gamma = metrics.get('gamma_norm', bands.get('gamma', 0.2))
         
-        bpm = int(60 + arousal * 140)
-        density = np.clip(0.2 + arousal * 0.6 - relaxation * 0.3, 0, 1)
-        brightness = np.clip(gamma * 2.0 + valence * 0.4, 0, 1)
-        guidance = 1.5 + focus * 4.0
-        temperature = 0.6 + theta * 2.0
+        # === BPM: arousal + beta drive tempo ===
+        # Low energy → 65-90, medium → 90-130, high → 130-190
+        bpm = int(65 + arousal * 100 + beta * 25)
         
-        # Scale
-        if valence > 0.6:
-            scale = 'D_MAJOR_B_MINOR' if arousal > 0.6 else ('G_MAJOR_E_MINOR' if arousal > 0.4 else 'C_MAJOR_A_MINOR')
-        elif valence > 0.4:
-            scale = 'A_MAJOR_G_FLAT_MINOR' if arousal > 0.5 else 'F_MAJOR_D_MINOR'
+        # === DENSITY: beta + focus = busy, delta + relaxation = sparse ===
+        density = np.clip(beta * 0.4 + focus * 0.3 + arousal * 0.2 - relaxation * 0.15 - delta * 0.1, 0, 1)
+        
+        # === BRIGHTNESS: gamma drives brightness, valence adds warmth ===
+        brightness = np.clip(gamma * 0.5 + valence * 0.3 + beta * 0.15 + 0.05, 0, 1)
+        
+        # === GUIDANCE: focus = follow prompts tightly, theta = more freedom ===
+        guidance = np.clip(1.0 + focus * 3.5 - theta * 1.5, 0, 6)
+        
+        # === TEMPERATURE: theta + relaxation = more variation, focus = less ===
+        temperature = np.clip(0.5 + theta * 1.2 + relaxation * 0.6 - focus * 0.4, 0, 3)
+        
+        # === TOP_K: higher with theta (more creative), lower with focus (more precise) ===
+        top_k = int(np.clip(20 + theta * 60 - focus * 30 + relaxation * 20, 1, 100))
+        
+        # === SCALE: HYBRID MODE ===
+        # If audio_scale provided (from violin), use it
+        # Otherwise use EEG-based scale (valence + arousal → emotional color)
+        if audio_scale:
+            scale = audio_scale
         else:
-            scale = 'E_FLAT_MAJOR_C_MINOR' if arousal > 0.6 else ('B_FLAT_MAJOR_G_MINOR' if arousal > 0.4 else 'A_FLAT_MAJOR_F_MINOR')
+            # Ordered from "brightest" to "darkest"
+            scales_bright = ['D_MAJOR_B_MINOR', 'G_MAJOR_E_MINOR', 'C_MAJOR_A_MINOR', 'F_MAJOR_D_MINOR']
+            scales_dark = ['A_FLAT_MAJOR_F_MINOR', 'E_FLAT_MAJOR_C_MINOR', 'B_FLAT_MAJOR_G_MINOR', 'B_MAJOR_A_FLAT_MINOR']
+            scales_neutral = ['A_MAJOR_G_FLAT_MINOR', 'E_MAJOR_D_FLAT_MINOR']
+            
+            if valence > 0.6:
+                idx = min(int((1 - arousal) * len(scales_bright)), len(scales_bright) - 1)
+                scale = scales_bright[idx]
+            elif valence < 0.35:
+                idx = min(int(arousal * len(scales_dark)), len(scales_dark) - 1)
+                scale = scales_dark[idx]
+            else:
+                scale = scales_neutral[0] if arousal > 0.5 else scales_neutral[1]
+        
+        # === MUTE DRUMS: only when deeply relaxed AND low arousal ===
+        mute_drums = (relaxation > 0.75) and (arousal < 0.3)
+        
+        # === MUTE BASS: only when gamma very dominant AND high energy (percussive/bright mode) ===
+        mute_bass = (gamma > 0.7) and (arousal > 0.7)
+        
+        # === ONLY BASS AND DRUMS: when delta very dominant (deep meditative) ===
+        only_bass_drums = (delta > 0.7) and (relaxation > 0.6)
+        
+        # === MUSIC GENERATION MODE: diversity when theta high (creative/dreamy) ===
+        if theta > 0.6:
+            gen_mode = 'DIVERSITY'
+        else:
+            gen_mode = 'QUALITY'
         
         return {
             'bpm': max(60, min(200, bpm)),
-            'density': max(0, min(1, density)),
-            'brightness': max(0, min(1, brightness)),
-            'guidance': max(0, min(6, guidance)),
-            'temperature': max(0, min(3, temperature)),
+            'density': float(np.clip(density, 0, 1)),
+            'brightness': float(np.clip(brightness, 0, 1)),
+            'guidance': float(np.clip(guidance, 0, 6)),
+            'temperature': float(np.clip(temperature, 0, 3)),
+            'top_k': top_k,
             'scale': scale,
-            'mute_drums': relaxation > 0.65,
-            'mute_bass': delta > 0.35,
+            'mute_drums': bool(mute_drums),
+            'mute_bass': bool(mute_bass),
+            'only_bass_and_drums': bool(only_bass_drums),
+            'music_generation_mode': gen_mode,
             **metrics
         }
     
@@ -175,37 +315,86 @@ class EEGProcessor:
         prompts = []
         arousal = params.get('arousal_adjusted', params['arousal'])
         valence = params.get('valence_adjusted', params['valence'])
+        focus = params.get('focus_adjusted', params.get('focus', 0.5))
         relaxation = params.get('relaxation_adjusted', params.get('relaxation', 0.5))
         
-        if arousal > 0.75:
-            prompts.append(("driving drums, energetic pulse, tight groove", 1.0))
-        elif arousal > 0.55:
-            prompts.append(("steady rhythm, flowing movement, moderate energy", 1.0))
-        elif arousal > 0.35:
-            prompts.append(("gentle pulse, soft dynamics, relaxed tempo", 1.0))
+        # Use normalized bands if available
+        delta = params.get('delta_norm', params.get('delta', 0.2))
+        theta = params.get('theta_norm', params.get('theta', 0.2))
+        alpha = params.get('alpha_norm', params.get('alpha', 0.2))
+        beta = params.get('beta_norm', params.get('beta', 0.2))
+        gamma = params.get('gamma_norm', params.get('gamma', 0.2))
+        
+        # === LAYER 1: Energy/rhythm prompt (from arousal) ===
+        if arousal > 0.8:
+            prompts.append(("Driving drums, Fat Beats, Tight Groove, Huge Drop", 1.0))
+        elif arousal > 0.6:
+            prompts.append(("Funk Drums, Danceable, Upbeat, Saturated Tones", 0.9))
+        elif arousal > 0.4:
+            prompts.append(("Steady rhythm, Sustained Chords, Subdued Melody", 0.8))
+        elif arousal > 0.2:
+            prompts.append(("Dreamy, Ethereal Ambience, Sustained Chords", 0.8))
         else:
-            prompts.append(("slow sustained drones, minimal rhythm, spacious", 1.0))
+            prompts.append(("Ominous Drone, Ambient, Echo, Spacey Synths", 0.7))
         
-        dominant = max(['delta', 'theta', 'alpha', 'beta', 'gamma'], key=lambda b: params.get(b, 0))
-        instruments = {
-            'delta': "deep bass, cello",
-            'theta': "synth pads, hang drum",
-            'alpha': "piano, acoustic guitar",
-            'beta': "electric guitar, marimba",
-            'gamma': "bright bells, glockenspiel"
+        # === LAYER 2: Instruments (from dominant band with richer palette) ===
+        dominant = max(['delta', 'theta', 'alpha', 'beta', 'gamma'],
+                       key=lambda b: params.get(f'{b}_norm', params.get(b, 0)))
+        
+        instruments_map = {
+            'delta': ["Boomy Bass", "Cello", "Precision Bass", "Tuba", "Didgeridoo"],
+            'theta': ["Synth Pads", "Hang Drum", "Mellotron", "Spacey Synths", "Kalimba"],
+            'alpha': ["Smooth Pianos", "Warm Acoustic Guitar", "Rhodes Piano", "Harp", "Vibraphone"],
+            'beta': ["Shredding Guitar", "Marimba", "TR-909 Drum Machine", "Trumpet", "Funk Drums"],
+            'gamma': ["Glockenspiel", "Bright bells", "Harmonica", "Steel Drum", "Mbira"]
         }
-        prompts.append((instruments.get(dominant, "piano"), 0.8))
         
+        # Pick 2 instruments based on how dominant the band is
+        band_instruments = instruments_map.get(dominant, ["Smooth Pianos"])
+        dom_value = params.get(f'{dominant}_norm', params.get(dominant, 0.5))
+        n_instruments = 2 if dom_value > 0.5 else 1
+        selected = band_instruments[:n_instruments]
+        prompts.append((", ".join(selected), 0.8))
+        
+        # === LAYER 3: Secondary band color ===
+        bands_sorted = sorted(['delta', 'theta', 'alpha', 'beta', 'gamma'],
+                              key=lambda b: params.get(f'{b}_norm', params.get(b, 0)), reverse=True)
+        secondary = bands_sorted[1]
+        sec_instruments = instruments_map.get(secondary, [])
+        if sec_instruments:
+            prompts.append((sec_instruments[0], 0.3))
+        
+        # === LAYER 4: Mood (from valence + relaxation) ===
+        if valence > 0.65 and arousal > 0.5:
+            prompts.append(("Upbeat, Bright Tones, Live Performance", 0.5))
+        elif valence > 0.65:
+            prompts.append(("Chill, Bright Tones, Lo-fi", 0.5))
+        elif valence < 0.35 and arousal > 0.5:
+            prompts.append(("Unsettling, Crunchy Distortion, Psychedelic", 0.5))
+        elif valence < 0.35:
+            prompts.append(("Ominous Drone, Echo, Experimental", 0.5))
+        else:
+            prompts.append(("Emotional, Rich Orchestration", 0.4))
+        
+        # === LAYER 5: Genre/style rotation on significant change ===
         if params.get('significant_change'):
-            self.current_style_idx = (self.current_style_idx + 1) % 6
+            self.current_style_idx = (self.current_style_idx + 1) % len(self._styles())
         
-        styles = ["ambient electronic", "neo classical", "lo-fi chill", "cinematic orchestral", "jazz fusion", "minimal techno"]
-        prompts.append((styles[self.current_style_idx], 0.4))
+        prompts.append((self._styles()[self.current_style_idx], 0.35))
         
         return prompts
     
+    def _styles(self):
+        """Extended style palette using Lyria's supported genres"""
+        return [
+            "Ambient", "Neo-Soul", "Lo-Fi Hip Hop", "Orchestral Score",
+            "Jazz Fusion", "Minimal Techno", "Indie Electronic", "Bossa Nova",
+            "Trip Hop", "Chillout", "Synthpop", "Indian Classical",
+            "Celtic Folk", "Deep House", "Shoegaze", "Electro Swing"
+        ]
+    
     def reset_baseline(self):
-        """Reset baseline para recalibrar"""
+        """Reset baseline for recalibration"""
         self.baseline_metrics = None
         self.baseline_samples = []
         self.prev_metrics = None
@@ -320,15 +509,21 @@ class MusicGenerator:
             await self.session.set_weighted_prompts(prompts=lyria_prompts)
             
             scale_enum = getattr(types.Scale, params['scale'], types.Scale.SCALE_UNSPECIFIED)
+            gen_mode_str = params.get('music_generation_mode', 'QUALITY')
+            gen_mode = getattr(types.MusicGenerationMode, gen_mode_str, types.MusicGenerationMode.QUALITY)
+            
             config = types.LiveMusicGenerationConfig(
                 bpm=params['bpm'],
                 density=params['density'],
                 brightness=params['brightness'],
                 guidance=params['guidance'],
                 temperature=params['temperature'],
+                top_k=params.get('top_k', 40),
                 scale=scale_enum,
                 mute_drums=params['mute_drums'],
                 mute_bass=params['mute_bass'],
+                only_bass_and_drums=params.get('only_bass_and_drums', False),
+                music_generation_mode=gen_mode,
             )
             await self.session.set_music_generation_config(config=config)
             
@@ -695,7 +890,41 @@ DASHBOARD_HTML = """
                     <button class="btn-stop" id="btn-stop" onclick="stopMusic()" disabled>⏹️ Stop</button>
                 </div>
                 
-                <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:15px;">🔄 Reset Baseline</button>
+                <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:8px;">🔄 Reset Baseline</button>
+                <button class="btn-secondary" id="btn-calibrate" onclick="startCalibration()" style="width:100%; margin-bottom:8px; background:#8e44ad;">📊 Calibrate (30s)</button>
+                <div id="calibration-status" style="display:none; background:rgba(142,68,173,0.2); border-radius:8px; padding:8px; margin-bottom:10px; text-align:center;">
+                    <div style="font-size:0.85em; margin-bottom:5px;" id="cal-text">Calibrating...</div>
+                    <div class="buffer-progress"><div class="buffer-fill" id="cal-bar" style="width:0%; background:#8e44ad;"></div></div>
+                </div>
+                <div id="calibration-results" style="display:none; background:rgba(142,68,173,0.15); border-radius:8px; padding:8px; margin-bottom:10px; font-size:0.75em; font-family:monospace;">
+                    <div style="font-weight:bold; margin-bottom:4px;">📊 Calibration Stats</div>
+                    <div id="cal-stats"></div>
+                </div>
+                
+                <!-- Audio Input Toggle -->
+                <div style="background:rgba(52,152,219,0.15); border-radius:8px; padding:10px; margin-bottom:10px;">
+                    <label style="display:flex; align-items:center; cursor:pointer;">
+                        <input type="checkbox" id="audio-toggle" onchange="toggleAudio()" style="margin-right:8px; width:18px; height:18px;">
+                        <span style="font-weight:bold;">🎻 Audio Input (Violin)</span>
+                    </label>
+                    <div id="audio-status" style="display:none; margin-top:8px; font-size:0.85em;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                            <span>Key:</span>
+                            <span id="audio-key" style="font-weight:bold; color:#3498db;">-</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                            <span>Confidence:</span>
+                            <span id="audio-conf">0%</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                            <span>Buffer:</span>
+                            <span id="audio-buffer">0/0</span>
+                        </div>
+                        <div style="font-size:0.75em; color:#7f8c8d; margin-top:4px;">
+                            <span>Pitches: </span><span id="audio-pitches">-</span>
+                        </div>
+                    </div>
+                </div>
                 
                 <div class="music-status">
                     <div class="music-param">
@@ -738,12 +967,28 @@ DASHBOARD_HTML = """
                         <span class="param-value" id="param-brightness">0.50</span>
                     </div>
                     <div class="music-param">
+                        <span class="param-label">Guidance</span>
+                        <span class="param-value" id="param-guidance">4.0</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Temperature</span>
+                        <span class="param-value" id="param-temperature">1.1</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Top-K</span>
+                        <span class="param-value" id="param-topk">40</span>
+                    </div>
+                    <div class="music-param">
                         <span class="param-label">Drums</span>
                         <span class="param-value" id="param-drums">ON</span>
                     </div>
                     <div class="music-param">
                         <span class="param-label">Bass</span>
                         <span class="param-value" id="param-bass">ON</span>
+                    </div>
+                    <div class="music-param">
+                        <span class="param-label">Mode</span>
+                        <span class="param-value" id="param-mode">QUALITY</span>
                     </div>
                 </div>
                 
@@ -811,11 +1056,13 @@ DASHBOARD_HTML = """
     </div>
     
     <script>
-        let ws;
+        let ws = null;
+        let wsReconnectTimer = null;
         let isGenerating = false;
         let startTime = null;
         let bandHistory = { delta: [], theta: [], alpha: [], beta: [], gamma: [] };
         const maxHistory = 60;
+        let messageQueue = [];
         
         // Chart
         const ctx = document.getElementById('bandChart').getContext('2d');
@@ -842,18 +1089,56 @@ DASHBOARD_HTML = """
             }
         });
         
+        function sendMessage(msg) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(msg));
+                return true;
+            } else {
+                console.warn('WebSocket not ready, queueing message:', msg);
+                messageQueue.push(msg);
+                return false;
+            }
+        }
+        
         function connect() {
+            // Prevent multiple connections
+            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+                console.log('WebSocket already connected or connecting');
+                return;
+            }
+            
+            if (wsReconnectTimer) {
+                clearTimeout(wsReconnectTimer);
+                wsReconnectTimer = null;
+            }
+            
+            console.log('Connecting to WebSocket...');
             ws = new WebSocket('ws://localhost:8767');
             
             ws.onopen = () => {
+                console.log('WebSocket connected');
                 document.getElementById('eeg-status').classList.add('connected');
-                addLog('Conectado al servidor');
+                addLog('✅ Conectado al servidor');
+                
+                // Send queued messages
+                while (messageQueue.length > 0) {
+                    const msg = messageQueue.shift();
+                    ws.send(JSON.stringify(msg));
+                    console.log('Sent queued message:', msg);
+                }
             };
             
             ws.onclose = () => {
+                console.log('WebSocket closed');
                 document.getElementById('eeg-status').classList.remove('connected');
-                addLog('Desconectado - reconectando...');
-                setTimeout(connect, 2000);
+                addLog('⚠️ Desconectado - reconectando...');
+                ws = null;
+                wsReconnectTimer = setTimeout(connect, 2000);
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                addLog('❌ Error de conexión');
             };
             
             ws.onmessage = (event) => {
@@ -884,6 +1169,21 @@ DASHBOARD_HTML = """
                     if (data.file) {
                         addLog('💾 Audio saved: ' + data.file, 'change');
                     }
+                } else if (data.type === 'calibration_complete') {
+                    document.getElementById('calibration-status').style.display = 'none';
+                    document.getElementById('btn-calibrate').disabled = false;
+                    document.getElementById('btn-calibrate').textContent = '📊 Re-Calibrate';
+                    document.getElementById('calibration-results').style.display = 'block';
+                    let html = '';
+                    const stats = data.stats;
+                    for (const key of ['delta','theta','alpha','beta','gamma','arousal','valence','focus','relaxation']) {
+                        if (stats[key]) {
+                            const s = stats[key];
+                            html += `<div>${key}: ${s.mean.toFixed(3)} ±${s.std.toFixed(3)} [${s.p10.toFixed(3)}–${s.p90.toFixed(3)}]</div>`;
+                        }
+                    }
+                    document.getElementById('cal-stats').innerHTML = html;
+                    addLog('📊 Calibration complete! Mappings now use your real ranges.', 'change');
                 } else if (data.type === 'log') {
                     addLog(data.message, data.level);
                 }
@@ -937,8 +1237,32 @@ DASHBOARD_HTML = """
                 document.getElementById('param-scale').textContent = formatScale(music.scale);
                 document.getElementById('param-density').textContent = music.density.toFixed(2);
                 document.getElementById('param-brightness').textContent = music.brightness.toFixed(2);
+                document.getElementById('param-guidance').textContent = (music.guidance || 4.0).toFixed(1);
+                document.getElementById('param-temperature').textContent = (music.temperature || 1.1).toFixed(1);
+                document.getElementById('param-topk').textContent = music.top_k || 40;
                 document.getElementById('param-drums').textContent = music.mute_drums ? 'OFF' : 'ON';
                 document.getElementById('param-bass').textContent = music.mute_bass ? 'OFF' : 'ON';
+                document.getElementById('param-mode').textContent = music.music_generation_mode || 'QUALITY';
+            }
+            
+            // Audio input status
+            if (metrics.audio_buffer_size !== undefined) {
+                document.getElementById('audio-buffer').textContent = metrics.audio_buffer_size + '/' + metrics.audio_buffer_max;
+                document.getElementById('audio-pitches').textContent = metrics.audio_pitches || '-';
+            }
+            if (metrics.audio_key) {
+                document.getElementById('audio-key').textContent = metrics.audio_key + ' ' + (metrics.audio_mode || '');
+                document.getElementById('audio-conf').textContent = (metrics.audio_confidence * 100).toFixed(0) + '%';
+            } else if (document.getElementById('audio-toggle').checked) {
+                document.getElementById('audio-key').textContent = 'detecting...';
+                document.getElementById('audio-conf').textContent = '0%';
+            }
+            
+            // Calibration progress
+            if (data.metrics && data.metrics.calibration_progress !== undefined) {
+                const pct = data.metrics.calibration_progress;
+                document.getElementById('cal-bar').style.width = pct.toFixed(0) + '%';
+                document.getElementById('cal-text').textContent = 'Calibrating... ' + pct.toFixed(0) + '%';
             }
             
             if (data.prompt) {
@@ -986,18 +1310,48 @@ DASHBOARD_HTML = """
         }
         
         function startMusic() {
-            ws.send(JSON.stringify({ action: 'start_music' }));
+            sendMessage({ action: 'start_music' });
             addLog('Starting music generation...');
         }
         
         function stopMusic() {
-            ws.send(JSON.stringify({ action: 'stop_music' }));
+            sendMessage({ action: 'stop_music' });
             addLog('Stopping music...');
         }
         
         function resetBaseline() {
-            ws.send(JSON.stringify({ action: 'reset_baseline' }));
+            sendMessage({ action: 'reset_baseline' });
             addLog('🔄 Resetting baseline...', 'change');
+        }
+        
+        function startCalibration() {
+            sendMessage({ action: 'start_calibration', duration: 30 });
+            document.getElementById('btn-calibrate').disabled = true;
+            document.getElementById('calibration-status').style.display = 'block';
+            document.getElementById('calibration-results').style.display = 'none';
+            document.getElementById('cal-bar').style.width = '0%';
+            document.getElementById('cal-text').textContent = 'Calibrating... 0%';
+            addLog('📊 Calibration started - sit still for 30s...', 'change');
+        }
+        
+        function toggleAudio() {
+            const enabled = document.getElementById('audio-toggle').checked;
+            
+            console.log('toggleAudio called, enabled:', enabled);
+            
+            if (sendMessage({ action: 'toggle_audio', enabled: enabled })) {
+                console.log('✓ Message sent immediately');
+            } else {
+                console.log('⚠ Message queued');
+            }
+            
+            if (enabled) {
+                document.getElementById('audio-status').style.display = 'block';
+                addLog('🎻 Enabling audio input...', 'change');
+            } else {
+                document.getElementById('audio-status').style.display = 'none';
+                addLog('🎻 Disabling audio input...', 'change');
+            }
         }
         
         // ============ SENSITIVITY CONTROLS ============
@@ -1024,7 +1378,7 @@ DASHBOARD_HTML = """
             document.getElementById('global-sens-val').textContent = settings.global_sensitivity.toFixed(1) + 'x';
             
             // Send to server
-            ws.send(JSON.stringify({ action: 'update_settings', settings: settings }));
+            sendMessage({ action: 'update_settings', settings: settings });
         }
         
         function resetSliders() {
@@ -1161,6 +1515,10 @@ async def run_dashboard_server():
     processor = EEGProcessor(sensitivity=2.5)
     music_gen = MusicGenerator()
     
+    # Audio pitch tracker (optional, for hybrid violin+EEG mode)
+    audio_tracker = None
+    audio_enabled = False
+    
     # Conectar MUSE
     inlet = None
     try:
@@ -1211,7 +1569,36 @@ async def run_dashboard_server():
                             eeg_data = np.array(eeg_buffer).T
                             bands = processor.extract_bands(eeg_data)
                             metrics = processor.calculate_metrics(bands)
-                            music_params = processor.map_to_lyria(bands, metrics)
+                            
+                            # Get audio scale if audio input is enabled
+                            audio_scale = None
+                            if audio_enabled and audio_tracker:
+                                audio_tracker.update_key()
+                                key_info = audio_tracker.get_current_key()
+                                
+                                # Send detailed audio status
+                                histogram = audio_tracker.get_pitch_histogram()
+                                buffer_size = len(audio_tracker.pitch_history)
+                                buffer_max = audio_tracker.pitch_history.maxlen
+                                
+                                # Get top pitches
+                                note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+                                top_pitches = []
+                                for i, count in enumerate(histogram):
+                                    if count > 0.1:
+                                        top_pitches.append(f"{note_names[i]}:{int(count*100)}%")
+                                
+                                metrics['audio_buffer_size'] = buffer_size
+                                metrics['audio_buffer_max'] = buffer_max
+                                metrics['audio_pitches'] = ', '.join(top_pitches) if top_pitches else 'none'
+                                
+                                if key_info['lyria_scale']:
+                                    audio_scale = key_info['lyria_scale']
+                                    metrics['audio_key'] = key_info['key']
+                                    metrics['audio_mode'] = key_info['mode']
+                                    metrics['audio_confidence'] = key_info['confidence']
+                            
+                            music_params = processor.map_to_lyria(bands, metrics, audio_scale=audio_scale)
                             prompts = processor.generate_prompts(music_params)
                             
                             # Convertir numpy types a Python nativos para JSON
@@ -1227,6 +1614,13 @@ async def run_dashboard_server():
                                 elif isinstance(obj, bool):
                                     return obj
                                 return obj
+                            
+                            # Send calibration_complete if just finished
+                            if metrics.get('calibration_complete') and processor.calibration_stats:
+                                await broadcast({
+                                    'type': 'calibration_complete',
+                                    'stats': to_json_safe(processor.calibration_stats)
+                                })
                             
                             # Enviar a clientes
                             await broadcast({
@@ -1282,10 +1676,56 @@ async def run_dashboard_server():
                         processor.reset_baseline()
                         await broadcast({'type': 'log', 'message': 'Baseline reset', 'level': 'change'})
                     
+                    elif action == 'start_calibration':
+                        duration = cmd.get('duration', 30)
+                        processor.start_calibration(duration=duration)
+                        await broadcast({'type': 'log', 'message': f'📊 Calibration started ({duration}s)', 'level': 'change'})
+                    
                     elif action == 'update_settings':
                         settings = cmd.get('settings', {})
                         processor.update_settings(settings)
                         logger.info(f"🎚️ Settings updated: smoothing={processor.smoothing}, sensitivity={processor.sensitivity:.1f}")
+                    
+                    elif action == 'toggle_audio':
+                        nonlocal audio_enabled, audio_tracker
+                        audio_enabled = cmd.get('enabled', False)
+                        logger.info(f"🎻 Toggle audio: {audio_enabled}")
+                        
+                        if audio_enabled:
+                            try:
+                                if not audio_tracker:
+                                    # Create audio tracker with default settings
+                                    logger.info("🎻 Creating AudioPitchTracker...")
+                                    audio_tracker = AudioPitchTracker(
+                                        pitch_history_seconds=8.0,
+                                        key_update_interval=4.0,
+                                        min_confidence=0.3,
+                                        min_notes_required=20
+                                    )
+                                    audio_tracker.start()
+                                    logger.info(f"🎻 Audio input started - buffer size: {audio_tracker.pitch_history.maxlen}")
+                                await broadcast({'type': 'log', 'message': '🎻 Audio input enabled', 'level': 'change'})
+                            except Exception as e:
+                                logger.error(f"🎻 Error starting audio: {e}")
+                                await broadcast({'type': 'log', 'message': f'🎻 Error: {e}', 'level': 'error'})
+                                audio_enabled = False
+                        else:
+                            if audio_tracker:
+                                audio_tracker.stop()
+                                audio_tracker = None
+                                logger.info("🎻 Audio input stopped")
+                            await broadcast({'type': 'log', 'message': '🎻 Audio input disabled', 'level': 'change'})
+                    
+                    elif action == 'update_audio_settings':
+                        if audio_tracker:
+                            settings = cmd.get('settings', {})
+                            audio_tracker.update_sensitivity(
+                                pitch_history_seconds=settings.get('window_size'),
+                                key_update_interval=settings.get('update_interval'),
+                                min_confidence=settings.get('min_confidence'),
+                                min_notes_required=settings.get('min_notes')
+                            )
+                            logger.info(f"🎻 Audio sensitivity updated")
                         
                 except Exception as e:
                     logger.error(f"Error comando: {e}")
