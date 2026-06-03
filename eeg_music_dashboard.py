@@ -16,6 +16,9 @@ from dotenv import load_dotenv
 import logging
 import threading
 
+from neuro_metrics import NeuroMetrics
+from emotional_prompts import EmotionalPromptGenerator, FlowInducer, GeminiPromptEvolver
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -40,10 +43,10 @@ EEG_BANDS = {
 class EEGProcessor:
     """Procesador de señales EEG con detección de cambios y sensibilidad configurable"""
     
-    def __init__(self, sensitivity=2.5):
-        self.smoothing = 3
+    def __init__(self, sensitivity=3.5):
+        self.smoothing = 2  # Reducido de 3 a 2 para cambios más rápidos
         self.band_history = {band: deque(maxlen=self.smoothing) for band in EEG_BANDS}
-        self.sensitivity = sensitivity
+        self.sensitivity = sensitivity  # Aumentado de 2.5 a 3.5
         self.prev_metrics = None
         self.baseline_metrics = None
         self.baseline_samples = []
@@ -57,6 +60,13 @@ class EEGProcessor:
             'beta': 1.0,
             'gamma': 1.0
         }
+        
+        # Nuevos sistemas neurocientíficos
+        self.neuro_metrics = NeuroMetrics(history_length=10)
+        self.prompt_generator = EmotionalPromptGenerator()
+        self.flow_inducer = FlowInducer()
+        self.gemini_evolver = GeminiPromptEvolver()
+        self.use_advanced_mode = True
     
     def update_settings(self, settings: dict):
         """Actualizar configuración desde la UI"""
@@ -98,42 +108,93 @@ class EEGProcessor:
         return band_powers
     
     def calculate_metrics(self, bands: dict) -> dict:
-        d, t, a, b, g = [bands.get(x, 0.2) for x in ['delta', 'theta', 'alpha', 'beta', 'gamma']]
-        
-        arousal = np.clip(0.1*d + 0.2*t + 0.3*a + 0.5*b + 0.7*g, 0, 1)
-        valence = np.clip((a - 0.3*t - 0.2*abs(b-t) + 0.5), 0, 1)
-        focus = np.clip(b / (t + 0.01) / 3, 0, 1)
-        relaxation = np.clip(a / (b + 0.01) / 2, 0, 1)
-        
-        metrics = {'arousal': arousal, 'valence': valence, 'focus': focus, 'relaxation': relaxation, **bands}
-        
-        # Baseline
-        if self.baseline_metrics is None:
-            self.baseline_samples.append(metrics.copy())
-            if len(self.baseline_samples) >= 5:
-                self.baseline_metrics = {
-                    k: np.mean([s[k] for s in self.baseline_samples])
-                    for k in ['arousal', 'valence', 'focus', 'relaxation']
-                }
-        
-        # Cambios relativos
-        if self.baseline_metrics:
-            for key in ['arousal', 'valence', 'focus', 'relaxation']:
-                delta = metrics[key] - self.baseline_metrics[key]
-                metrics[f'{key}_adjusted'] = np.clip(
-                    self.baseline_metrics[key] + delta * self.sensitivity, 0, 1
-                )
-        
-        # Detectar cambios
-        metrics['significant_change'] = False
-        if self.prev_metrics:
-            for key in ['arousal', 'valence']:
-                if abs(metrics[key] - self.prev_metrics[key]) > 0.05:
-                    metrics['significant_change'] = True
-                    break
-        
-        self.prev_metrics = metrics.copy()
-        return metrics
+        """
+        Calcula métricas usando el sistema neurocientífico avanzado
+        """
+        if self.use_advanced_mode:
+            # Usar sistema neurocientífico completo
+            comprehensive_state = self.neuro_metrics.get_comprehensive_state(bands)
+            
+            # Mantener compatibilidad con código existente
+            metrics = {
+                'arousal': comprehensive_state['arousal'],
+                'valence': comprehensive_state['valence'],
+                'focus': comprehensive_state['engagement'],
+                'relaxation': comprehensive_state['relaxation'],
+                **bands,
+                # Nuevas métricas
+                'flow_score': comprehensive_state['flow_score'],
+                'flow_stability': comprehensive_state['flow_stability'],
+                'in_flow': comprehensive_state['in_flow'],
+                'emotion': comprehensive_state['emotion'],
+                'stress_score': comprehensive_state['stress_score'],
+                'cognitive_state': comprehensive_state['cognitive_state'],
+                'workload': comprehensive_state['workload']
+            }
+            
+            # Baseline
+            if self.baseline_metrics is None:
+                self.baseline_samples.append(metrics.copy())
+                if len(self.baseline_samples) >= 5:
+                    self.baseline_metrics = {
+                        k: np.mean([s[k] for s in self.baseline_samples])
+                        for k in ['arousal', 'valence', 'focus', 'relaxation']
+                    }
+            
+            # Cambios relativos
+            if self.baseline_metrics:
+                for key in ['arousal', 'valence', 'focus', 'relaxation']:
+                    delta = metrics[key] - self.baseline_metrics[key]
+                    metrics[f'{key}_adjusted'] = np.clip(
+                        self.baseline_metrics[key] + delta * self.sensitivity, 0, 1
+                    )
+            
+            # Detectar cambios
+            metrics['significant_change'] = False
+            if self.prev_metrics:
+                for key in ['arousal', 'valence']:
+                    if abs(metrics[key] - self.prev_metrics[key]) > 0.05:
+                        metrics['significant_change'] = True
+                        break
+            
+            self.prev_metrics = metrics.copy()
+            return metrics
+            
+        else:
+            # Modo legacy (original)
+            d, t, a, b, g = [bands.get(x, 0.2) for x in ['delta', 'theta', 'alpha', 'beta', 'gamma']]
+            
+            arousal = np.clip(0.1*d + 0.2*t + 0.3*a + 0.5*b + 0.7*g, 0, 1)
+            valence = np.clip((a - 0.3*t - 0.2*abs(b-t) + 0.5), 0, 1)
+            focus = np.clip(b / (t + 0.01) / 3, 0, 1)
+            relaxation = np.clip(a / (b + 0.01) / 2, 0, 1)
+            
+            metrics = {'arousal': arousal, 'valence': valence, 'focus': focus, 'relaxation': relaxation, **bands}
+            
+            if self.baseline_metrics is None:
+                self.baseline_samples.append(metrics.copy())
+                if len(self.baseline_samples) >= 5:
+                    self.baseline_metrics = {
+                        k: np.mean([s[k] for s in self.baseline_samples])
+                        for k in ['arousal', 'valence', 'focus', 'relaxation']
+                    }
+            
+            if self.baseline_metrics:
+                for key in ['arousal', 'valence', 'focus', 'relaxation']:
+                    delta = metrics[key] - self.baseline_metrics[key]
+                    metrics[f'{key}_adjusted'] = np.clip(
+                        self.baseline_metrics[key] + delta * self.sensitivity, 0, 1
+                    )
+            
+            metrics['significant_change'] = False
+            if self.prev_metrics:
+                for key in ['arousal', 'valence']:
+                    if abs(metrics[key] - self.prev_metrics[key]) > 0.05:
+                        metrics['significant_change'] = True
+                        break
+            
+            self.prev_metrics = metrics.copy()
+            return metrics
     
     def map_to_lyria(self, bands: dict, metrics: dict) -> dict:
         arousal = metrics.get('arousal_adjusted', metrics['arousal'])
@@ -143,66 +204,121 @@ class EEGProcessor:
         
         delta = bands.get('delta', 0.2)
         theta = bands.get('theta', 0.2)
+        alpha = bands.get('alpha', 0.2)
+        beta = bands.get('beta', 0.2)
         gamma = bands.get('gamma', 0.2)
         
-        bpm = int(60 + arousal * 140)
-        density = np.clip(0.2 + arousal * 0.6 - relaxation * 0.3, 0, 1)
-        brightness = np.clip(gamma * 2.0 + valence * 0.4, 0, 1)
-        guidance = 1.5 + focus * 4.0
-        temperature = 0.6 + theta * 2.0
+        # CAMBIOS MÁS DRAMÁTICOS - rango completo de variación
         
-        # Scale
+        # BPM: rango completo 60-180 (antes 60-200 pero poco usado)
+        bpm = int(60 + arousal * 120)
+        
+        # Density: rango completo 0.0-1.0 (más variación)
+        density = np.clip(arousal * 0.9 - relaxation * 0.4, 0, 1)
+        
+        # Brightness: mucho más sensible a gamma y valence
+        brightness = np.clip(gamma * 4.0 + valence * 0.6 - delta * 0.3, 0, 1)
+        
+        # Guidance: más variación (0.5-5.5)
+        guidance = 0.5 + focus * 5.0
+        
+        # Temperature: más extremo para cambios evidentes (0.3-2.5)
+        temperature = 0.3 + theta * 2.2 + (1.0 - focus) * 0.5
+        
+        # Scale - más variedad y cambios más frecuentes
         if valence > 0.6:
-            scale = 'D_MAJOR_B_MINOR' if arousal > 0.6 else ('G_MAJOR_E_MINOR' if arousal > 0.4 else 'C_MAJOR_A_MINOR')
-        elif valence > 0.4:
-            scale = 'A_MAJOR_G_FLAT_MINOR' if arousal > 0.5 else 'F_MAJOR_D_MINOR'
+            if arousal > 0.7:
+                scale = 'D_MAJOR_B_MINOR'  # Muy energético y positivo
+            elif arousal > 0.5:
+                scale = 'G_MAJOR_E_MINOR'  # Energético moderado
+            else:
+                scale = 'C_MAJOR_A_MINOR'  # Positivo pero calmado
+        elif valence > 0.35:
+            if arousal > 0.6:
+                scale = 'A_MAJOR_G_FLAT_MINOR'  # Neutral energético
+            else:
+                scale = 'F_MAJOR_D_MINOR'  # Neutral calmado
         else:
-            scale = 'E_FLAT_MAJOR_C_MINOR' if arousal > 0.6 else ('B_FLAT_MAJOR_G_MINOR' if arousal > 0.4 else 'A_FLAT_MAJOR_F_MINOR')
+            if arousal > 0.7:
+                scale = 'E_FLAT_MAJOR_C_MINOR'  # Negativo intenso
+            elif arousal > 0.4:
+                scale = 'B_FLAT_MAJOR_G_MINOR'  # Negativo moderado
+            else:
+                scale = 'A_FLAT_MAJOR_F_MINOR'  # Muy oscuro y lento
+        
+        # Mutes más dinámicos
+        mute_drums = relaxation > 0.7 or alpha > 0.4  # Mutear drums si muy relajado
+        mute_bass = delta > 0.5  # Mutear bass si mucho delta
         
         return {
-            'bpm': max(60, min(200, bpm)),
-            'density': max(0, min(1, density)),
-            'brightness': max(0, min(1, brightness)),
-            'guidance': max(0, min(6, guidance)),
-            'temperature': max(0, min(3, temperature)),
+            'bpm': max(60, min(180, bpm)),
+            'density': max(0.05, min(0.95, density)),  # Evitar extremos absolutos
+            'brightness': max(0.05, min(0.95, brightness)),
+            'guidance': max(0.5, min(5.5, guidance)),
+            'temperature': max(0.3, min(2.5, temperature)),
             'scale': scale,
-            'mute_drums': relaxation > 0.65,
-            'mute_bass': delta > 0.35,
+            'mute_drums': mute_drums,
+            'mute_bass': mute_bass,
             **metrics
         }
     
     def generate_prompts(self, params: dict) -> list:
-        prompts = []
-        arousal = params.get('arousal_adjusted', params['arousal'])
-        valence = params.get('valence_adjusted', params['valence'])
-        relaxation = params.get('relaxation_adjusted', params.get('relaxation', 0.5))
-        
-        if arousal > 0.75:
-            prompts.append(("driving drums, energetic pulse, tight groove", 1.0))
-        elif arousal > 0.55:
-            prompts.append(("steady rhythm, flowing movement, moderate energy", 1.0))
-        elif arousal > 0.35:
-            prompts.append(("gentle pulse, soft dynamics, relaxed tempo", 1.0))
+        """
+        Genera prompts usando el sistema evolutivo o el modo legacy.
+        Si GeminiPromptEvolver está activo, usa el prompt LLM como capa base.
+        Lanza llamada Gemini en background para el próximo ciclo.
+        """
+        if self.use_advanced_mode:
+            # Lanzar evolución Gemini en background (no bloquea)
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(self.gemini_evolver.evolve_async(params))
+            except Exception:
+                pass
+
+            # Si Gemini ya tiene un prompt, inyectarlo como base layer
+            if self.gemini_evolver.is_ready:
+                gemini_base = self.gemini_evolver.current_prompt
+                self.prompt_generator.base_genre = gemini_base
+                self.prompt_generator.genre_locked = True
+
+            # Generar prompt multicapa con la base actual (Gemini o estática)
+            prompt_data = self.prompt_generator.generate_layered_prompt(params)
+            return [(prompt_data['prompt'], 1.0)]
         else:
-            prompts.append(("slow sustained drones, minimal rhythm, spacious", 1.0))
-        
-        dominant = max(['delta', 'theta', 'alpha', 'beta', 'gamma'], key=lambda b: params.get(b, 0))
-        instruments = {
-            'delta': "deep bass, cello",
-            'theta': "synth pads, hang drum",
-            'alpha': "piano, acoustic guitar",
-            'beta': "electric guitar, marimba",
-            'gamma': "bright bells, glockenspiel"
-        }
-        prompts.append((instruments.get(dominant, "piano"), 0.8))
-        
-        if params.get('significant_change'):
-            self.current_style_idx = (self.current_style_idx + 1) % 6
-        
-        styles = ["ambient electronic", "neo classical", "lo-fi chill", "cinematic orchestral", "jazz fusion", "minimal techno"]
-        prompts.append((styles[self.current_style_idx], 0.4))
-        
-        return prompts
+            # Modo legacy (original)
+            prompts = []
+            arousal = params.get('arousal_adjusted', params['arousal'])
+            valence = params.get('valence_adjusted', params['valence'])
+            relaxation = params.get('relaxation_adjusted', params.get('relaxation', 0.5))
+            
+            if arousal > 0.75:
+                prompts.append(("driving drums, energetic pulse, tight groove", 1.0))
+            elif arousal > 0.55:
+                prompts.append(("steady rhythm, flowing movement, moderate energy", 1.0))
+            elif arousal > 0.35:
+                prompts.append(("gentle pulse, soft dynamics, relaxed tempo", 1.0))
+            else:
+                prompts.append(("slow sustained drones, minimal rhythm, spacious", 1.0))
+            
+            dominant = max(['delta', 'theta', 'alpha', 'beta', 'gamma'], key=lambda b: params.get(b, 0))
+            instruments = {
+                'delta': "deep bass, cello",
+                'theta': "synth pads, hang drum",
+                'alpha': "piano, acoustic guitar",
+                'beta': "electric guitar, marimba",
+                'gamma': "bright bells, glockenspiel"
+            }
+            prompts.append((instruments.get(dominant, "piano"), 0.8))
+            
+            if params.get('significant_change'):
+                self.current_style_idx = (self.current_style_idx + 1) % 6
+            
+            styles = ["ambient electronic", "neo classical", "lo-fi chill", "cinematic orchestral", "jazz fusion", "minimal techno"]
+            prompts.append((styles[self.current_style_idx], 0.4))
+            
+            return prompts
     
     def reset_baseline(self):
         """Reset baseline para recalibrar"""
