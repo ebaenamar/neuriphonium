@@ -249,81 +249,52 @@ class EEGProcessor:
 
 
 class MusicGenerator:
-    """Generador de música con Lyria"""
+    """Generador de música local con Magenta RealTime 2"""
     
     def __init__(self):
         self.is_generating = False
-        self.session = None
-        self.client = None
         self.audio_chunks = []
-        self.current_params = None
+        self.current_style_embedding = None
         self.start_time = None
         self.buffer_ready = False
         self.buffer_progress = 0
         self.audio_callback = None  # Callback para enviar audio al navegador
-    
+        
+        logger.info("🧠 Cargando modelo local Magenta RealTime 2 (mrt2_small)...")
+        from magenta_rt.mlx.system import MagentaRT2SystemMlxfn
+        self.mrt = MagentaRT2SystemMlxfn(size='mrt2_small')
+        self.state = None
+        logger.info("✅ Modelo local Magenta RealTime 2 listo.")
+        
     async def start(self):
-        """Iniciar sesión de Lyria"""
+        """Iniciar generación de música local"""
         if self.is_generating:
             return False
         
-        try:
-            from google import genai
-            from google.genai import types
-            
-            api_key = os.getenv("GEMINI_API_KEY")
-            if not api_key:
-                logger.error("GEMINI_API_KEY not found")
-                return False
-            
-            self.client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
-            self._connection = self.client.aio.live.music.connect(model='models/lyria-realtime-exp')
-            self.session = await self._connection.__aenter__()
-            
-            await self.session.set_weighted_prompts(
-                prompts=[types.WeightedPrompt(text="gentle flowing music", weight=1.0)]
-            )
-            await self.session.set_music_generation_config(
-                config=types.LiveMusicGenerationConfig(bpm=80, temperature=1.0)
-            )
-            
-            await self.session.play()
-            self.is_generating = True
-            self.start_time = time.time()
-            self.audio_chunks = []
-            self.buffer_ready = False
-            self.buffer_progress = 0
-            
-            logger.info("🎵 Lyria iniciado")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error iniciando Lyria: {e}")
-            return False
-    
+        self.is_generating = True
+        self.start_time = time.time()
+        self.audio_chunks = []
+        self.buffer_ready = False
+        self.buffer_progress = 0
+        self.state = None  # Reset state para una nueva sesión
+        
+        # Codificar estilo inicial por defecto
+        self.current_style_embedding = self.mrt.embed_style("gentle flowing atmospheric music, ambient, calm")
+        
+        logger.info("🎵 Generación local de Magenta iniciada")
+        return True
+        
     async def stop(self):
-        """Detener sesión de Lyria"""
+        """Detener generación de música local"""
         if not self.is_generating:
             return None
+            
+        self.is_generating = False
         
-        try:
-            if self.session:
-                await self.session.pause()
-            if hasattr(self, '_connection') and self._connection:
-                await self._connection.__aexit__(None, None, None)
-            
-            self.is_generating = False
-            self.session = None
-            
-            # Guardar audio
-            if self.audio_chunks:
-                return self._save_audio()
-            
-        except Exception as e:
-            logger.error(f"Error deteniendo Lyria: {e}")
-        
+        if self.audio_chunks:
+            return self._save_audio()
         return None
-    
+        
     def _save_audio(self):
         """Guardar audio a archivo"""
         os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -342,89 +313,79 @@ class MusicGenerator:
         duration = len(audio_data) / (SAMPLE_RATE_AUDIO * 2 * CHANNELS)
         logger.info(f"💾 Audio guardado: {filepath} ({duration:.1f}s)")
         return filepath
-    
-    async def update(self, params: dict, prompts: list):
-        """Actualizar parámetros de Lyria"""
-        if not self.is_generating or not self.session:
-            return
         
-        try:
-            from google.genai import types
+    async def update(self, params: dict, prompts: list):
+        """Actualizar estilo de Magenta"""
+        if not self.is_generating:
+            return
             
+        try:
             self.current_params = params
             
-            lyria_prompts = [types.WeightedPrompt(text=t, weight=w) for t, w in prompts]
-            await self.session.set_weighted_prompts(prompts=lyria_prompts)
-            
-            scale_enum = getattr(types.Scale, params['scale'], types.Scale.SCALE_UNSPECIFIED)
-            config = types.LiveMusicGenerationConfig(
-                bpm=params['bpm'],
-                density=params['density'],
-                brightness=params['brightness'],
-                guidance=params['guidance'],
-                temperature=params['temperature'],
-                scale=scale_enum,
-                mute_drums=params['mute_drums'],
-                mute_bass=params['mute_bass'],
-            )
-            await self.session.set_music_generation_config(config=config)
+            # Combinar prompts en una sola cadena descriptiva
+            combined_prompt = ", ".join([text for text, weight in prompts if weight > 0.3])
+            if not combined_prompt:
+                combined_prompt = "calm atmospheric music, ambient"
+                
+            self.current_style_embedding = self.mrt.embed_style(combined_prompt)
             
         except Exception as e:
-            logger.error(f"Error actualizando Lyria: {e}")
-    
+            logger.error(f"Error actualizando estilo de Magenta: {e}")
+            
     async def receive_audio(self):
-        """Recibir audio de Lyria y enviarlo al navegador"""
-        if not self.session:
-            logger.error("No session for receive_audio")
-            return
-        
+        """Bucle continuo de generación de audio y envío al navegador"""
         import base64
+        import asyncio
         chunk_count = 0
         
+        frames_per_step = 10
+        step_duration = frames_per_step * 0.04
+        
         try:
-            logger.info("🎧 Starting audio receive loop...")
-            async for message in self.session.receive():
-                if not self.is_generating:
-                    logger.info("Stopping - not generating")
-                    break
-                    
-                # Log message type for debugging
-                if chunk_count == 0:
-                    logger.info(f"First message type: {type(message)}")
-                    logger.info(f"Message attrs: {dir(message)}")
-                    if hasattr(message, 'server_content'):
-                        logger.info(f"server_content: {message.server_content}")
+            logger.info("🎧 Iniciando bucle local de generación de audio...")
+            while self.is_generating:
+                t_start = time.time()
                 
-                if hasattr(message, 'server_content') and message.server_content:
-                    if hasattr(message.server_content, 'audio_chunks') and message.server_content.audio_chunks:
-                        for chunk in message.server_content.audio_chunks:
-                            chunk_count += 1
-                            self.audio_chunks.append(chunk.data)
-                            
-                            # Log every 10 chunks
-                            if chunk_count % 10 == 0:
-                                logger.info(f"🎵 Received {chunk_count} audio chunks ({len(chunk.data)} bytes each)")
-                            
-                            # Enviar audio al navegador si hay callback
-                            if self.audio_callback:
-                                audio_b64 = base64.b64encode(chunk.data).decode('utf-8')
-                                await self.audio_callback({
-                                    'type': 'audio',
-                                    'data': audio_b64,
-                                    'sample_rate': SAMPLE_RATE_AUDIO,
-                                    'channels': CHANNELS
-                                })
-                            
-                            # Calcular progreso del buffer (20s)
-                            total_bytes = sum(len(c) for c in self.audio_chunks)
-                            target_bytes = 20 * SAMPLE_RATE_AUDIO * CHANNELS * 2
-                            self.buffer_progress = min(100, (total_bytes / target_bytes) * 100)
-                            if self.buffer_progress >= 100:
-                                self.buffer_ready = True
-            
-            logger.info(f"Audio receive loop ended. Total chunks: {chunk_count}")
+                waveform, self.state = self.mrt.generate(
+                    style=self.current_style_embedding,
+                    frames=frames_per_step,
+                    state=self.state,
+                    temperature=1.2,
+                    top_k=40
+                )
+                
+                samples_int16 = (waveform.samples * 32767.0).astype(np.int16)
+                chunk_data = samples_int16.tobytes()
+                
+                chunk_count += 1
+                self.audio_chunks.append(chunk_data)
+                
+                if chunk_count % 10 == 0:
+                    logger.info(f"🎵 Generados {chunk_count} chunks locales (~{chunk_count*step_duration:.1f}s)")
+                    
+                if self.audio_callback:
+                    audio_b64 = base64.b64encode(chunk_data).decode('utf-8')
+                    await self.audio_callback({
+                        'type': 'audio',
+                        'data': audio_b64,
+                        'sample_rate': SAMPLE_RATE_AUDIO,
+                        'channels': CHANNELS
+                    })
+                    
+                total_bytes = sum(len(c) for c in self.audio_chunks)
+                target_bytes = 20 * SAMPLE_RATE_AUDIO * CHANNELS * 2
+                self.buffer_progress = min(100, (total_bytes / target_bytes) * 100)
+                if self.buffer_progress >= 100:
+                    self.buffer_ready = True
+                    
+                generation_time = time.time() - t_start
+                sleep_time = max(0, step_duration - generation_time)
+                
+                await asyncio.sleep(sleep_time * 0.95)
+                
+            logger.info(f"Bucle local finalizado. Total de chunks generados: {chunk_count}")
         except Exception as e:
-            logger.error(f"Error recibiendo audio: {e}")
+            logger.error(f"Error en bucle de generación de audio: {e}")
             import traceback
             traceback.print_exc()
 
