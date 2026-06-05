@@ -115,11 +115,12 @@ async def test_muse_lyria_integration():
             for state_name, duration in states:
                 print(f"🧠 Simulating state: {state_name.upper()} ({duration}s)")
                 
-                # Generate synthetic EEG
-                eeg_data = generate_synthetic_eeg(state_name)
+                # Generate synthetic EEG and feed it multiple times to flush the smoothing history
+                for _ in range(adapter.smoothing_window):
+                    eeg_data = generate_synthetic_eeg(state_name)
+                    band_powers = adapter.extract_band_powers(eeg_data)
                 
-                # Extract band powers and map to music
-                band_powers = adapter.extract_band_powers(eeg_data)
+                # Map to music parameters
                 music_params = adapter.map_to_music_params(band_powers)
                 prompt = adapter.generate_prompt_from_state(music_params)
                 

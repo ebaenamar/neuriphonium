@@ -176,6 +176,13 @@ class EEGProcessor:
         arousal = params.get('arousal_adjusted', params['arousal'])
         valence = params.get('valence_adjusted', params['valence'])
         relaxation = params.get('relaxation_adjusted', params.get('relaxation', 0.5))
+        focus = params.get('focus_adjusted', params.get('focus', 0.5))
+        
+        delta = params.get('delta', 0.2)
+        theta = params.get('theta', 0.2)
+        alpha = params.get('alpha', 0.2)
+        beta = params.get('beta', 0.2)
+        gamma = params.get('gamma', 0.2)
         
         if arousal > 0.75:
             prompts.append(("driving drums, energetic pulse, tight groove", 1.0))
@@ -185,22 +192,52 @@ class EEGProcessor:
             prompts.append(("gentle pulse, soft dynamics, relaxed tempo", 1.0))
         else:
             prompts.append(("slow sustained drones, minimal rhythm, spacious", 1.0))
+            
+        if valence > 0.65:
+            prompts.append(("bright joyful and uplifting harmonies", valence))
+        elif valence < 0.35:
+            prompts.append(("contemplative mysterious and deeply melancholic mood", 0.7 - valence))
+            
+        if focus > 0.65:
+            prompts.append(("tight precise and highly structured patterns", focus))
+        elif relaxation > 0.65:
+            prompts.append(("spacious drifting and ethereal ambient textures", relaxation))
+            
+        if theta > 0.35:
+            prompts.append(("dreamy surreal otherworldly atmosphere", theta * 1.5))
+        if gamma > 0.25:
+            prompts.append(("brilliant sparkling details, shimmering highs", gamma * 2.0))
         
         dominant = max(['delta', 'theta', 'alpha', 'beta', 'gamma'], key=lambda b: params.get(b, 0))
-        instruments = {
-            'delta': "deep bass, cello",
-            'theta': "synth pads, hang drum",
-            'alpha': "piano, acoustic guitar",
-            'beta': "electric guitar, marimba",
-            'gamma': "bright bells, glockenspiel"
+        instrument_presets = {
+            'delta': ["deep contrabass and warm cello", "sub-bass pulses and massive drones"],
+            'theta': ["ethereal hang drum and wooden kalimba", "drifting celestial synth pads"],
+            'alpha': ["intimate grand piano and warm classical guitar", "soft electric rhodes piano and nylon strings"],
+            'beta': ["crisp marimba and bright vibraphone", "energetic synthesizer bass and electric guitar leads"],
+            'gamma': ["glistening bells and chimes", "sparkling digital synths and harp glissandos"]
         }
-        prompts.append((instruments.get(dominant, "piano"), 0.8))
+        idx = 1 if arousal > 0.55 else 0
+        instrument_prompt = instrument_presets.get(dominant, ["piano", "piano"])[idx]
+        prompts.append((instrument_prompt, 0.8))
         
+        if arousal > 0.5:
+            if valence > 0.5:
+                styles = ["organic jazz fusion", "energetic electro-pop", "uplifting house groove"]
+            else:
+                styles = ["dramatic cinematic orchestral", "dark minimal techno", "intense cyber-punk synth"]
+        else:
+            if valence > 0.5:
+                styles = ["peaceful neo-classical piano", "warm lo-fi chillhop", "gentle folktronica"]
+            else:
+                styles = ["contemplative ambient drone", "deep melancholic shoegaze", "mysterious dark ambient"]
+                
         if params.get('significant_change'):
-            self.current_style_idx = (self.current_style_idx + 1) % 6
-        
-        styles = ["ambient electronic", "neo classical", "lo-fi chill", "cinematic orchestral", "jazz fusion", "minimal techno"]
-        prompts.append((styles[self.current_style_idx], 0.4))
+            self.current_style_idx = (self.current_style_idx + 1) % len(styles)
+        else:
+            self.current_style_idx = self.current_style_idx % len(styles)
+            
+        selected_style = styles[self.current_style_idx]
+        prompts.append((selected_style, 0.5))
         
         return prompts
     
