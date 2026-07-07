@@ -295,6 +295,18 @@
             <div class="card">
                 <h2><span class="status" id="music-status"></span> Music Control</h2>
                 
+                <div style="margin-bottom:15px;">
+                    <label style="font-size:0.85em; opacity:0.7; display:block; margin-bottom:6px;">Music Engine</label>
+                    <div style="display:flex; gap:8px;">
+                        <button id="engine-local" onclick="selectEngine('local')" style="flex:1; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(78,205,196,0.2); color:#e6edf3; cursor:pointer; font-size:0.85em;">
+                            🧠 Local (Magenta)
+                        </button>
+                        <button id="engine-online" onclick="selectEngine('online')" style="flex:1; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#e6edf3; cursor:pointer; font-size:0.85em;">
+                            ☁️ Online (Lyria)
+                        </button>
+                    </div>
+                </div>
+                
                 <div class="music-controls">
                     <button class="btn-start" id="btn-start" onclick="startMusic()">▶️ Start Music</button>
                     <button class="btn-stop" id="btn-stop" onclick="stopMusic()" disabled>⏹️ Stop</button>
@@ -468,6 +480,8 @@
                     updateEEG(data);
                 } else if (data.type === 'audio') {
                     handleAudioChunk(data);
+                } else if (data.type === 'audio_mp3') {
+                    handleMP3Clip(data);
                 } else if (data.type === 'music_status') {
                     updateMusicStatus(data);
                 } else if (data.type === 'music_started') {
@@ -590,8 +604,17 @@
             return map[scale] || scale;
         }
         
+        let selectedEngine = 'local';
+        
+        function selectEngine(engine) {
+            selectedEngine = engine;
+            document.getElementById('engine-local').style.background = engine === 'local' ? 'rgba(78,205,196,0.2)' : 'rgba(255,255,255,0.05)';
+            document.getElementById('engine-online').style.background = engine === 'online' ? 'rgba(78,205,196,0.2)' : 'rgba(255,255,255,0.05)';
+            addLog('Engine: ' + (engine === 'local' ? 'Local (Magenta)' : 'Online (Lyria)'));
+        }
+        
         function startMusic() {
-            ws.send(JSON.stringify({ action: 'start_music' }));
+            ws.send(JSON.stringify({ action: 'start_music', engine: selectedEngine }));
             addLog('Starting music generation...');
         }
         
@@ -669,7 +692,7 @@
         let audioQueue = [];
         let isPlaying = false;
         let nextPlayTime = 0;
-        const BUFFER_SECONDS = 5; // Buffer before starting playback
+        const BUFFER_SECONDS = 3; // Buffer before starting playback
         let totalBufferedSeconds = 0;
         let playbackStarted = false;
         
@@ -728,7 +751,12 @@
         }
         
         function scheduleBuffers() {
-            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + 2) {
+            // If we fell behind realtime, catch up to avoid gaps
+            if (nextPlayTime < audioContext.currentTime) {
+                nextPlayTime = audioContext.currentTime + 0.05;
+            }
+            // Schedule up to 10s ahead for smooth playback
+            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + 10) {
                 const buffer = audioQueue.shift();
                 const source = audioContext.createBufferSource();
                 source.buffer = buffer;
@@ -738,8 +766,33 @@
             }
             
             if (isGenerating || audioQueue.length > 0) {
-                setTimeout(scheduleBuffers, 100);
+                setTimeout(scheduleBuffers, 20);
             }
+        }
+        
+        function handleMP3Clip(data) {
+            if (!audioContext) initAudio();
+            
+            const binaryString = atob(data.data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            audioContext.decodeAudioData(bytes.buffer, function(audioBuffer) {
+                audioQueue.push(audioBuffer);
+                totalBufferedSeconds += audioBuffer.duration;
+                addLog(`🎵 Clip ${data.clip} decoded (${audioBuffer.duration.toFixed(1)}s)`, 'change');
+                
+                if (!playbackStarted && totalBufferedSeconds >= 2) {
+                    playbackStarted = true;
+                    nextPlayTime = audioContext.currentTime + 0.1;
+                    scheduleBuffers();
+                    addLog('🔊 Playback started!', 'change');
+                }
+            }, function(err) {
+                addLog('❌ MP3 decode error: ' + err, 'error');
+            });
         }
         
         function stopAudio() {

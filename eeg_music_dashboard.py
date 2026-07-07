@@ -259,6 +259,14 @@ class MusicGenerator:
         self.buffer_ready = False
         self.buffer_progress = 0
         self.audio_callback = None  # Callback para enviar audio al navegador
+        self._gen_temperature = 1.2
+        self._gen_top_k = 40
+        self._gen_cfg_musiccoca = 3.0
+        self._gen_drums = None
+        self._target_style_embedding = None
+        self._style_blend = 0.4  # Faster style movement (was 0.15, too slow)
+        self._vibe_history = deque(maxlen=10)
+        self._tflite_lock = threading.Lock()  # TFLite interpreters aren't thread-safe
         
         logger.info("🧠 Cargando modelo local Magenta RealTime 2 (mrt2_small)...")
         from magenta_rt.mlx.system import MagentaRT2SystemMlxfn
@@ -314,20 +322,175 @@ class MusicGenerator:
         logger.info(f"💾 Audio guardado: {filepath} ({duration:.1f}s)")
         return filepath
         
+    def _build_vibe_prompt(self, params: dict) -> str:
+        """Build a continuous vibe prompt from EEG bands — no discrete thresholds.
+        Each band contributes proportionally to the musical texture."""
+        delta = params.get('delta', 0.2)
+        theta = params.get('theta', 0.2)
+        alpha = params.get('alpha', 0.2)
+        beta = params.get('beta', 0.2)
+        gamma = params.get('gamma', 0.2)
+        arousal = params.get('arousal_adjusted', params.get('arousal', 0.5))
+        valence = params.get('valence_adjusted', params.get('valence', 0.5))
+        relaxation = params.get('relaxation_adjusted', params.get('relaxation', 0.5))
+        focus = params.get('focus_adjusted', params.get('focus', 0.5))
+        
+        # --- Energy layer (continuous) ---
+        energy_words = []
+        if arousal > 0.05:
+            energy_words.append("sustained tones")
+        if arousal > 0.25:
+            energy_words.append("gentle pulse")
+        if arousal > 0.45:
+            energy_words.append("flowing rhythm")
+        if arousal > 0.65:
+            energy_words.append("driving groove")
+        if arousal > 0.8:
+            energy_words.append("intense energy")
+        energy_str = ", ".join(energy_words[-2:]) if energy_words else "calm"
+        
+        # --- Mood layer (valence: dark <-> bright, continuous blend) ---
+        if valence < 0.5:
+            mood_str = "contemplative, introspective"
+            if valence < 0.3:
+                mood_str += ", melancholic"
+        else:
+            mood_str = "warm, open"
+            if valence > 0.7:
+                mood_str += ", uplifting"
+        
+        # --- Texture layer (from individual bands, weighted blend) ---
+        texture_parts = []
+        
+        # Delta: depth, gravity, bass presence
+        if delta > 0.15:
+            weight = min(delta * 3, 1.0)
+            texture_parts.append(f"deep bass drones ({weight:.0%})")
+        
+        # Theta: dreamy, surreal, creative
+        if theta > 0.15:
+            weight = min(theta * 3, 1.0)
+            texture_parts.append(f"dreamy drifting atmosphere ({weight:.0%})")
+        
+        # Alpha: smooth, flowing, melodic
+        if alpha > 0.15:
+            weight = min(alpha * 3, 1.0)
+            texture_parts.append(f"smooth flowing melodies ({weight:.0%})")
+        
+        # Beta: structured, precise, rhythmic
+        if beta > 0.15:
+            weight = min(beta * 3, 1.0)
+            texture_parts.append(f"precise rhythmic patterns ({weight:.0%})")
+        
+        # Gamma: sparkling, brilliant, complex
+        if gamma > 0.1:
+            weight = min(gamma * 4, 1.0)
+            texture_parts.append(f"sparkling shimmering details ({weight:.0%})")
+        
+        texture_str = ", ".join(texture_parts) if texture_parts else "balanced texture"
+        
+        # --- Space layer (relaxation vs focus) ---
+        if relaxation > 0.6:
+            space_str = "spacious, reverb-drenched, ethereal"
+        elif focus > 0.6:
+            space_str = "tight, focused, intimate"
+        else:
+            space_str = "natural room ambience"
+        
+        # --- Instrument layer (dominant band selects timbre) ---
+        bands = {'delta': delta, 'theta': theta, 'alpha': alpha, 'beta': beta, 'gamma': gamma}
+        dominant = max(bands, key=bands.get)
+        instrument_map = {
+            'delta': "contrabass, cello, sub-bass",
+            'theta': "hang drum, kalimba, celestial pads",
+            'alpha': "grand piano, nylon guitar, warm rhodes",
+            'beta': "marimba, vibraphone, electric guitar",
+            'gamma': "bells, chimes, harp, digital synths",
+        }
+        instruments = instrument_map.get(dominant, "piano")
+        
+        # Combine all layers
+        prompt = f"{energy_str}, {mood_str}, {texture_str}, {space_str}, {instruments}, instrumental, no vocals"
+        return prompt
+    
     async def update(self, params: dict, prompts: list):
-        """Actualizar estilo de Magenta"""
+        """Actualizar estilo de Magenta con mapping continuo y transiciones suaves"""
         if not self.is_generating:
             return
             
         try:
             self.current_params = params
             
-            # Combinar prompts en una sola cadena descriptiva
-            combined_prompt = ", ".join([text for text, weight in prompts if weight > 0.3])
-            if not combined_prompt:
-                combined_prompt = "calm atmospheric music, ambient"
-                
-            self.current_style_embedding = self.mrt.embed_style(combined_prompt)
+            # --- Continuous parameter mapping (no thresholds) ---
+            delta = params.get('delta', 0.2)
+            theta = params.get('theta', 0.2)
+            alpha = params.get('alpha', 0.2)
+            beta = params.get('beta', 0.2)
+            gamma = params.get('gamma', 0.2)
+            arousal = params.get('arousal_adjusted', params.get('arousal', 0.5))
+            relaxation = params.get('relaxation_adjusted', params.get('relaxation', 0.5))
+            focus = params.get('focus_adjusted', params.get('focus', 0.5))
+            
+            # Amplify band differences: normalize each band relative to its running mean
+            # This makes small EEG fluctuations produce large musical changes
+            
+            # Temperature: wide range, driven by theta/alpha contrast
+            # theta high = creative/unpredictable, alpha high = stable/consonant
+            # arousal adds energy, delta adds gravity
+            theta_alpha_ratio = theta / (alpha + 0.01)
+            target_temp = np.clip(
+                0.5 + theta_alpha_ratio * 1.2 + arousal * 0.8 - delta * 0.4,
+                0.3, 3.0
+            )
+            
+            # Top-k: gamma/beta contrast drives variety vs precision
+            gamma_beta_ratio = gamma / (beta + 0.01)
+            target_top_k = int(np.clip(
+                10 + gamma_beta_ratio * 30 + arousal * 20 - focus * 15,
+                5, 100
+            ))
+            
+            # Faster interpolation — respond to brain changes quickly
+            temp_blend = 0.5
+            self._gen_temperature = self._gen_temperature * (1 - temp_blend) + target_temp * temp_blend
+            self._gen_top_k = int(self._gen_top_k * (1 - temp_blend) + target_top_k * temp_blend)
+            
+            # CFG guidance: how strongly generation follows the style prompt.
+            # Default (3.0) is weak -> generic/flat sound. Focus+arousal push it
+            # up to 6.5 for punchier, more expressive adherence to the vibe.
+            target_cfg = np.clip(2.0 + focus * 2.5 + arousal * 2.0, 1.5, 6.5)
+            self._gen_cfg_musiccoca = self._gen_cfg_musiccoca * (1 - temp_blend) + target_cfg * temp_blend
+            
+            # Drums: force on above an arousal threshold to add rhythmic movement.
+            # Below threshold, leave masked (None) so the model decides freely
+            # instead of forcing silence (which flattens the sound further).
+            self._gen_drums = [1] if arousal > 0.4 else None
+            
+            # --- Build vibe prompt and compute target style embedding ---
+            vibe_prompt = self._build_vibe_prompt(params)
+            self._vibe_history.append(vibe_prompt)
+            
+            # Compute target embedding in a background thread to avoid blocking audio.
+            # Guarded by a lock since the underlying TFLite interpreters are not
+            # thread-safe and would race against generate()'s style tokenization.
+            def _embed_style_locked(prompt):
+                with self._tflite_lock:
+                    return self.mrt.embed_style(prompt)
+            
+            loop = asyncio.get_event_loop()
+            self._target_style_embedding = await loop.run_in_executor(
+                None, _embed_style_locked, vibe_prompt
+            )
+            
+            # Interpolate style embedding smoothly (blend toward target)
+            if self.current_style_embedding is not None and self._target_style_embedding is not None:
+                import mlx.core as mx
+                current_np = np.array(self.current_style_embedding)
+                target_np = np.array(self._target_style_embedding)
+                blended = current_np * (1 - self._style_blend) + target_np * self._style_blend
+                self.current_style_embedding = mx.array(blended.tolist())
+            else:
+                self.current_style_embedding = self._target_style_embedding
             
         except Exception as e:
             logger.error(f"Error actualizando estilo de Magenta: {e}")
@@ -338,21 +501,27 @@ class MusicGenerator:
         import asyncio
         chunk_count = 0
         
-        frames_per_step = 10
+        frames_per_step = 25
         step_duration = frames_per_step * 0.04
         
         try:
-            logger.info("🎧 Iniciando bucle local de generación de audio...")
+            logger.info(f"🎧 Iniciando bucle local de generación ({frames_per_step} frames = {step_duration:.1f}s/audio)...")
             while self.is_generating:
                 t_start = time.time()
                 
-                waveform, self.state = self.mrt.generate(
-                    style=self.current_style_embedding,
-                    frames=frames_per_step,
-                    state=self.state,
-                    temperature=1.2,
-                    top_k=40
-                )
+                with self._tflite_lock:
+                    waveform, self.state = self.mrt.generate(
+                        style=self.current_style_embedding,
+                        drums=self._gen_drums,
+                        frames=frames_per_step,
+                        state=self.state,
+                        temperature=self._gen_temperature,
+                        top_k=self._gen_top_k,
+                        cfg_musiccoca=self._gen_cfg_musiccoca
+                    )
+                
+                generation_time = time.time() - t_start
+                realtime_ratio = step_duration / generation_time if generation_time > 0 else 0
                 
                 samples_int16 = (waveform.samples * 32767.0).astype(np.int16)
                 chunk_data = samples_int16.tobytes()
@@ -360,8 +529,8 @@ class MusicGenerator:
                 chunk_count += 1
                 self.audio_chunks.append(chunk_data)
                 
-                if chunk_count % 10 == 0:
-                    logger.info(f"🎵 Generados {chunk_count} chunks locales (~{chunk_count*step_duration:.1f}s)")
+                if chunk_count % 5 == 0:
+                    logger.info(f"🎵 Chunk {chunk_count}: {generation_time:.2f}s gen / {step_duration:.1f}s audio (ratio {realtime_ratio:.2f}x) | temp={self._gen_temperature:.2f} top_k={self._gen_top_k} cfg={self._gen_cfg_musiccoca:.2f} drums={self._gen_drums}")
                     
                 if self.audio_callback:
                     audio_b64 = base64.b64encode(chunk_data).decode('utf-8')
@@ -377,17 +546,182 @@ class MusicGenerator:
                 self.buffer_progress = min(100, (total_bytes / target_bytes) * 100)
                 if self.buffer_progress >= 100:
                     self.buffer_ready = True
-                    
-                generation_time = time.time() - t_start
-                sleep_time = max(0, step_duration - generation_time)
                 
-                await asyncio.sleep(sleep_time * 0.95)
+                await asyncio.sleep(0)
                 
             logger.info(f"Bucle local finalizado. Total de chunks generados: {chunk_count}")
         except Exception as e:
             logger.error(f"Error en bucle de generación de audio: {e}")
             import traceback
             traceback.print_exc()
+
+
+class LyriaOnlineGenerator:
+    """Generador de música online con Google Lyria 3 Clip API"""
+    
+    def __init__(self):
+        self.is_generating = False
+        self.audio_chunks = []
+        self.client = None
+        self.buffer_ready = False
+        self.buffer_progress = 0
+        self.current_params = None
+        self.current_prompts = [("gentle flowing atmospheric music, ambient, calm", 1.0)]
+        self.audio_callback = None
+        
+        from dotenv import load_dotenv
+        load_dotenv()
+        
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY not found in .env")
+        
+        from google import genai
+        self.client = genai.Client(api_key=api_key)
+        logger.info("✅ Lyria 3 online client initialized")
+    
+    async def start(self):
+        if self.is_generating:
+            return False
+        
+        self.is_generating = True
+        self.audio_chunks = []
+        self.buffer_ready = False
+        self.buffer_progress = 0
+        
+        logger.info("🎵 Lyria 3 online generation started")
+        return True
+    
+    async def stop(self):
+        if not self.is_generating:
+            return None
+        
+        self.is_generating = False
+        
+        if self.audio_chunks:
+            return self._save_audio()
+        return None
+    
+    def _save_audio(self):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"eeg_music_{timestamp}.mp3"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        
+        audio_data = b''.join(self.audio_chunks)
+        with open(filepath, 'wb') as f:
+            f.write(audio_data)
+        
+        logger.info(f"💾 Audio guardado: {filepath} ({len(audio_data)} bytes)")
+        return filepath
+    
+    async def update(self, params, prompts):
+        if not self.is_generating:
+            return
+        self.current_params = params
+        self.current_prompts = prompts
+    
+    def _build_prompt(self):
+        parts = [(text, weight) for text, weight in self.current_prompts if weight > 0.3]
+        if not parts:
+            return "calm atmospheric instrumental music, no vocals"
+        
+        # Separar por categoría basándose en el contenido del prompt
+        mood_parts = []
+        instrument_parts = []
+        style_parts = []
+        atmosphere_parts = []
+        
+        for text, weight in parts:
+            text_lower = text.lower()
+            if any(w in text_lower for w in ['drum', 'pulse', 'groove', 'rhythm', 'tempo', 'drone', 'spacious', 'sustained']):
+                mood_parts.append(text)
+            elif any(w in text_lower for w in ['bright', 'joyful', 'melancholic', 'mysterious', 'uplifting', 'contemplative']):
+                mood_parts.append(text)
+            elif any(w in text_lower for w in ['tight', 'precise', 'structured', 'drifting', 'ethereal', 'ambient']):
+                atmosphere_parts.append(text)
+            elif any(w in text_lower for w in ['dreamy', 'surreal', 'otherworldly', 'sparkling', 'shimmering', 'brilliant', 'glistening']):
+                atmosphere_parts.append(text)
+            elif any(w in text_lower for w in ['piano', 'guitar', 'synth', 'bass', 'cello', 'drum', 'marimba', 'vibraphone', 'bell', 'chime', 'harp', 'kalimba', 'rhodes', 'contrabass']):
+                instrument_parts.append(text)
+            else:
+                style_parts.append(text)
+        
+        # Construir prompt estructurado tipo [0:00 - 0:30] para Lyria 3
+        prompt_sections = []
+        prompt_sections.append("instrumental only, no vocals")
+        
+        if atmosphere_parts:
+            prompt_sections.append(", ".join(atmosphere_parts))
+        if mood_parts:
+            prompt_sections.append(", ".join(mood_parts))
+        if instrument_parts:
+            prompt_sections.append(", ".join(instrument_parts))
+        if style_parts:
+            prompt_sections.append(", ".join(style_parts))
+        
+        return ", ".join(prompt_sections)
+    
+    async def receive_audio(self):
+        import base64
+        clip_count = 0
+        
+        try:
+            logger.info("🎧 Iniciando generación de clips Lyria 3...")
+            
+            while self.is_generating:
+                prompt = self._build_prompt()
+                logger.info(f"🎵 Generating clip {clip_count + 1} with Lyria 3 Clip...")
+                logger.info(f"   Prompt: {prompt[:80]}...")
+                
+                t_start = time.time()
+                
+                try:
+                    loop = asyncio.get_event_loop()
+                    interaction = await loop.run_in_executor(
+                        None,
+                        lambda: self.client.interactions.create(
+                            model="lyria-3-clip-preview",
+                            input=prompt,
+                        )
+                    )
+                    
+                    gen_time = time.time() - t_start
+                    logger.info(f"   Generated in {gen_time:.1f}s")
+                    
+                    if interaction.output_audio and interaction.output_audio.data:
+                        audio_bytes = base64.b64decode(interaction.output_audio.data)
+                        self.audio_chunks.append(audio_bytes)
+                        clip_count += 1
+                        
+                        if self.audio_callback:
+                            audio_b64 = interaction.output_audio.data
+                            await self.audio_callback({
+                                'type': 'audio_mp3',
+                                'data': audio_b64,
+                                'clip': clip_count,
+                            })
+                        
+                        total_mb = sum(len(c) for c in self.audio_chunks) / (1024 * 1024)
+                        self.buffer_progress = min(100, clip_count * 25)
+                        if self.buffer_progress >= 100:
+                            self.buffer_ready = True
+                        
+                        logger.info(f"   Clip {clip_count}: {len(audio_bytes)} bytes ({total_mb:.1f}MB total)")
+                    
+                except Exception as e:
+                    logger.error(f"Error generating clip: {e}")
+                    await asyncio.sleep(2)
+            
+            logger.info(f"Lyria 3 generation stopped. {clip_count} clips generated.")
+        
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            if self.is_generating:
+                logger.error(f"Error en Lyria 3: {e}")
+                import traceback
+                traceback.print_exc()
 
 
 # HTML del Dashboard
@@ -688,6 +1022,18 @@ DASHBOARD_HTML = """
             <div class="card">
                 <h2><span class="status" id="music-status"></span> Music Control</h2>
                 
+                <div style="margin-bottom:15px;">
+                    <label style="font-size:0.85em; opacity:0.7; display:block; margin-bottom:6px;">Music Engine</label>
+                    <div style="display:flex; gap:8px;">
+                        <button id="engine-local" onclick="selectEngine('local')" style="flex:1; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(78,205,196,0.2); color:#e6edf3; cursor:pointer; font-size:0.85em;">
+                            🧠 Local (Magenta)
+                        </button>
+                        <button id="engine-online" onclick="selectEngine('online')" style="flex:1; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#e6edf3; cursor:pointer; font-size:0.85em;">
+                            ☁️ Online (Lyria)
+                        </button>
+                    </div>
+                </div>
+                
                 <div class="music-controls">
                     <button class="btn-start" id="btn-start" onclick="startMusic()">▶️ Start Music</button>
                     <button class="btn-stop" id="btn-stop" onclick="stopMusic()" disabled>⏹️ Stop</button>
@@ -861,6 +1207,8 @@ DASHBOARD_HTML = """
                     updateEEG(data);
                 } else if (data.type === 'audio') {
                     handleAudioChunk(data);
+                } else if (data.type === 'audio_mp3') {
+                    handleMP3Clip(data);
                 } else if (data.type === 'music_status') {
                     updateMusicStatus(data);
                 } else if (data.type === 'music_started') {
@@ -983,8 +1331,17 @@ DASHBOARD_HTML = """
             return map[scale] || scale;
         }
         
+        let selectedEngine = 'local';
+        
+        function selectEngine(engine) {
+            selectedEngine = engine;
+            document.getElementById('engine-local').style.background = engine === 'local' ? 'rgba(78,205,196,0.2)' : 'rgba(255,255,255,0.05)';
+            document.getElementById('engine-online').style.background = engine === 'online' ? 'rgba(78,205,196,0.2)' : 'rgba(255,255,255,0.05)';
+            addLog('Engine: ' + (engine === 'local' ? 'Local (Magenta)' : 'Online (Lyria)'));
+        }
+        
         function startMusic() {
-            ws.send(JSON.stringify({ action: 'start_music' }));
+            ws.send(JSON.stringify({ action: 'start_music', engine: selectedEngine }));
             addLog('Starting music generation...');
         }
         
@@ -1062,7 +1419,7 @@ DASHBOARD_HTML = """
         let audioQueue = [];
         let isPlaying = false;
         let nextPlayTime = 0;
-        const BUFFER_SECONDS = 5; // Buffer before starting playback
+        const BUFFER_SECONDS = 3; // Buffer before starting playback
         let totalBufferedSeconds = 0;
         let playbackStarted = false;
         
@@ -1121,7 +1478,12 @@ DASHBOARD_HTML = """
         }
         
         function scheduleBuffers() {
-            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + 2) {
+            // If we fell behind realtime, catch up to avoid gaps
+            if (nextPlayTime < audioContext.currentTime) {
+                nextPlayTime = audioContext.currentTime + 0.05;
+            }
+            // Schedule up to 10s ahead for smooth playback
+            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + 10) {
                 const buffer = audioQueue.shift();
                 const source = audioContext.createBufferSource();
                 source.buffer = buffer;
@@ -1131,8 +1493,33 @@ DASHBOARD_HTML = """
             }
             
             if (isGenerating || audioQueue.length > 0) {
-                setTimeout(scheduleBuffers, 100);
+                setTimeout(scheduleBuffers, 20);
             }
+        }
+        
+        function handleMP3Clip(data) {
+            if (!audioContext) initAudio();
+            
+            const binaryString = atob(data.data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            audioContext.decodeAudioData(bytes.buffer, function(audioBuffer) {
+                audioQueue.push(audioBuffer);
+                totalBufferedSeconds += audioBuffer.duration;
+                addLog(`🎵 Clip ${data.clip} decoded (${audioBuffer.duration.toFixed(1)}s)`, 'change');
+                
+                if (!playbackStarted && totalBufferedSeconds >= 2) {
+                    playbackStarted = true;
+                    nextPlayTime = audioContext.currentTime + 0.1;
+                    scheduleBuffers();
+                    addLog('🔊 Playback started!', 'change');
+                }
+            }, function(err) {
+                addLog('❌ MP3 decode error: ' + err, 'error');
+            });
         }
         
         function stopAudio() {
@@ -1157,19 +1544,27 @@ async def run_dashboard_server():
     import websockets
     
     processor = EEGProcessor(sensitivity=2.5)
-    music_gen = MusicGenerator()
+    state = {
+        'music_gen': None,
+        'music_gen_local': None,
+        'music_gen_online': None,
+        'current_engine': None,
+    }
     
-    # Conectar MUSE
-    inlet = None
+    # Conectar MUSE (inicial, pero se reconecta dinámicamente después)
+    eeg_state = {
+        'inlet': None,
+        'reconnecting': False,
+    }
     try:
         from pylsl import StreamInlet, resolve_byprop
         logger.info("🔍 Buscando MUSE...")
         streams = resolve_byprop('type', 'EEG', timeout=10)
         if streams:
-            inlet = StreamInlet(streams[0])
+            eeg_state['inlet'] = StreamInlet(streams[0])
             logger.info(f"✅ MUSE conectado: {streams[0].name()}")
         else:
-            logger.warning("⚠️ MUSE no encontrado")
+            logger.warning("⚠️ MUSE no encontrado — se reconectará automáticamente cuando detecte el stream")
     except Exception as e:
         logger.warning(f"⚠️ Error MUSE: {e}")
     
@@ -1179,6 +1574,35 @@ async def run_dashboard_server():
     async def broadcast(message):
         if connected_clients:
             await asyncio.gather(*[client.send(json.dumps(message)) for client in connected_clients])
+    
+    async def broadcast_fire(message):
+        """Fire-and-forget broadcast for large messages like audio chunks"""
+        if connected_clients:
+            fut = asyncio.ensure_future(asyncio.gather(
+                *[client.send(json.dumps(message)) for client in connected_clients]
+            ))
+            await asyncio.sleep(0)
+    
+    async def reconnect_muse():
+        """Busca MUSE periódicamente si no hay conexión activa"""
+        from pylsl import StreamInlet, resolve_byprop
+        while True:
+            if eeg_state['inlet'] is None and not eeg_state['reconnecting']:
+                eeg_state['reconnecting'] = True
+                try:
+                    logger.info("🔄 Buscando stream MUSE...")
+                    streams = resolve_byprop('type', 'EEG', timeout=3)
+                    if streams:
+                        eeg_state['inlet'] = StreamInlet(streams[0])
+                        logger.info(f"✅ MUSE conectado: {streams[0].name()}")
+                        await broadcast({'type': 'log', 'message': 'MUSE EEG conectado', 'level': 'change'})
+                    else:
+                        logger.info("⏳ MUSE no detectado, reintentando en 3s...")
+                except Exception as e:
+                    logger.warning(f"⚠️ Error reconectando MUSE: {e}")
+                finally:
+                    eeg_state['reconnecting'] = False
+            await asyncio.sleep(3)
     
     async def handler(websocket):
         connected_clients.add(websocket)
@@ -1191,15 +1615,25 @@ async def run_dashboard_server():
             async def process_eeg():
                 nonlocal eeg_buffer
                 last_update = 0
+                empty_pulls = 0
                 
                 while True:
                     try:
+                        inlet = eeg_state['inlet']
                         if inlet:
                             sample, _ = inlet.pull_sample(timeout=0.1)
                             if sample:
                                 eeg_buffer.append(sample[:4])
+                                empty_pulls = 0
+                            else:
+                                empty_pulls += 1
+                                if empty_pulls > 30:
+                                    logger.warning("⚠️ MUSE stream perdido, esperando reconexión...")
+                                    eeg_state['inlet'] = None
+                                    empty_pulls = 0
+                                    await asyncio.sleep(1)
                         else:
-                            # Datos simulados
+                            # Datos simulados mientras se reconecta MUSE
                             t = time.time()
                             sample = [np.sin(2*np.pi*10*t + i*0.5) + np.random.randn()*0.1 for i in range(4)]
                             eeg_buffer.append(sample)
@@ -1226,8 +1660,8 @@ async def run_dashboard_server():
                                     return obj
                                 return obj
                             
-                            # Enviar a clientes
-                            await broadcast({
+                            # Enviar a clientes (fire-and-forget to not block audio)
+                            await broadcast_fire({
                                 'type': 'eeg',
                                 'bands': to_json_safe(bands),
                                 'metrics': to_json_safe(metrics),
@@ -1235,17 +1669,18 @@ async def run_dashboard_server():
                                 'prompt': prompts[0][0] if prompts else ''
                             })
                             
-                            # Actualizar Lyria si está generando
+                            # Actualizar música si está generando
                             now = time.time()
-                            if music_gen.is_generating and now - last_update >= 1.5:
+                            mg = state['music_gen']
+                            if mg and mg.is_generating and now - last_update >= 3.0:
                                 last_update = now
-                                await music_gen.update(music_params, prompts)
+                                await mg.update(music_params, prompts)
                                 
                                 # Enviar estado del buffer
                                 await broadcast({
                                     'type': 'music_status',
-                                    'buffer_progress': music_gen.buffer_progress,
-                                    'buffer_ready': music_gen.buffer_ready
+                                    'buffer_progress': mg.buffer_progress,
+                                    'buffer_ready': mg.buffer_ready
                                 })
                             
                             eeg_buffer = eeg_buffer[WINDOW_SIZE // 2:]
@@ -1263,15 +1698,41 @@ async def run_dashboard_server():
                     action = cmd.get('action')
                     
                     if action == 'start_music':
-                        # Configurar callback para enviar audio al navegador
-                        music_gen.audio_callback = broadcast
-                        success = await music_gen.start()
+                        engine = cmd.get('engine', 'local')
+                        
+                        if state['music_gen'] and state['music_gen'].is_generating:
+                            logger.warning("Music already generating, ignoring start")
+                            continue
+                        
+                        if engine == 'online':
+                            if state['music_gen_online'] is None:
+                                try:
+                                    state['music_gen_online'] = LyriaOnlineGenerator()
+                                except Exception as e:
+                                    logger.error(f"Failed to init Lyria online: {e}")
+                                    await broadcast({'type': 'log', 'message': f'Error: {e}', 'level': 'error'})
+                                    continue
+                            state['music_gen'] = state['music_gen_online']
+                        else:
+                            if state['music_gen_local'] is None:
+                                state['music_gen_local'] = MusicGenerator()
+                            state['music_gen'] = state['music_gen_local']
+                        
+                        state['current_engine'] = engine
+                        mg = state['music_gen']
+                        mg.audio_callback = broadcast_fire
+                        success = await mg.start()
                         if success:
-                            audio_task = asyncio.create_task(music_gen.receive_audio())
+                            audio_task = asyncio.create_task(mg.receive_audio())
                             await broadcast({'type': 'music_started'})
+                            logger.info(f"🎵 Music started with engine: {engine}")
                     
                     elif action == 'stop_music':
-                        filepath = await music_gen.stop()
+                        mg = state['music_gen']
+                        if mg:
+                            filepath = await mg.stop()
+                        else:
+                            filepath = None
                         if audio_task:
                             audio_task.cancel()
                         await broadcast({'type': 'music_stopped', 'file': filepath})
@@ -1295,9 +1756,11 @@ async def run_dashboard_server():
                 audio_task.cancel()
             logger.info(f"📱 Cliente desconectado ({len(connected_clients)})")
     
+    reconnect_task = asyncio.create_task(reconnect_muse())
     server = await websockets.serve(handler, "localhost", 8767)
     logger.info("🌐 Dashboard server en ws://localhost:8767")
     await server.wait_closed()
+    reconnect_task.cancel()
 
 
 def save_dashboard():

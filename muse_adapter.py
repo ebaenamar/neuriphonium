@@ -12,10 +12,11 @@ MUSE Channels:
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Callable, Optional
+from typing import Dict, Callable, Optional, List
 from collections import deque
 import logging
 import time
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -609,6 +610,218 @@ def test_muse_adapter():
         print(f"  Arousal={music_params['arousal']:.2f}, Valence={music_params['valence']:.2f}")
         print(f"  BPM={music_params['bpm']}, Density={music_params['density']:.2f}")
         print(f"  🎵 Prompt: {prompt}")
+
+
+class MuseConnectionManager:
+    """
+    Gestor de conexión MUSE que maneja todos los sensores disponibles:
+    - EEG (4 canales, 256 Hz)
+    - Accelerometer (3 ejes X/Y/Z, 52 Hz, unidades: g)
+    - Gyroscope (3 ejes X/Y/Z, 52 Hz, unidades: dps)
+    
+    Características:
+    - Descubrimiento automático de streams LSL
+    - Conexión/desconexión por sensor
+    - Reconexión automática con backoff
+    - Buffers circulares con historial configurable
+    - Callbacks por sensor para consumidores
+    - Reporte de estado y estadísticas en tiempo real
+    """
+    
+    SENSOR_TYPES = {
+        'eeg':  {'lsl_type': 'EEG',  'channels': 4, 'rate': 256, 'units': 'uV'},
+        'acc':  {'lsl_type': 'ACC',  'channels': 3, 'rate': 52,  'units': 'g'},
+        'gyro': {'lsl_type': 'GYRO', 'channels': 3, 'rate': 52,  'units': 'dps'},
+    }
+    
+    def __init__(self, history_seconds=10):
+        self.history_seconds = history_seconds
+        self.inlets = {}
+        self.threads = {}
+        self.running = False
+        self.connected = {}
+        self.sample_counts = {}
+        self.last_sample_ts = {}
+        self.start_time = None
+        
+        self._buffers = {}
+        self._callbacks = {}
+        self._lock = threading.Lock()
+        
+        for sensor in self.SENSOR_TYPES:
+            self._buffers[sensor] = deque(maxlen=history_seconds * self.SENSOR_TYPES[sensor]['rate'])
+            self._callbacks[sensor] = None
+            self.connected[sensor] = False
+            self.sample_counts[sensor] = 0
+            self.last_sample_ts[sensor] = None
+    
+    def discover(self) -> Dict[str, bool]:
+        """Descubre qué streams LSL de MUSE están disponibles."""
+        from pylsl import resolve_byprop
+        available = {}
+        for sensor, info in self.SENSOR_TYPES.items():
+            streams = resolve_byprop('type', info['lsl_type'], timeout=3)
+            available[sensor] = len(streams) > 0
+            if streams:
+                logger.info(f"  ✅ {sensor.upper()}: {streams[0].name()} ({streams[0].nominal_srate()} Hz, {streams[0].channel_count()} ch)")
+            else:
+                logger.info(f"  ❌ {sensor.upper()}: no stream found")
+        return available
+    
+    def connect_sensor(self, sensor: str) -> bool:
+        """Conecta a un sensor específico via LSL."""
+        if sensor not in self.SENSOR_TYPES:
+            logger.error(f"Unknown sensor: {sensor}")
+            return False
+        
+        info = self.SENSOR_TYPES[sensor]
+        from pylsl import StreamInlet, resolve_byprop
+        
+        streams = resolve_byprop('type', info['lsl_type'], timeout=5)
+        if not streams:
+            logger.warning(f"⚠️ No {sensor.upper()} stream found")
+            self.connected[sensor] = False
+            return False
+        
+        self.inlets[sensor] = StreamInlet(streams[0])
+        self.connected[sensor] = True
+        logger.info(f"✅ {sensor.upper()} connected: {streams[0].name()} ({streams[0].nominal_srate()} Hz)")
+        return True
+    
+    def connect_all(self) -> Dict[str, bool]:
+        """Conecta a todos los sensores disponibles."""
+        logger.info("🔍 Discovering MUSE streams...")
+        available = self.discover()
+        results = {}
+        for sensor in self.SENSOR_TYPES:
+            if available[sensor]:
+                results[sensor] = self.connect_sensor(sensor)
+            else:
+                results[sensor] = False
+        return results
+    
+    def set_callback(self, sensor: str, callback: Callable[[list, float], None]):
+        """Registra un callback para un sensor. Se llama con (sample_list, timestamp)."""
+        if sensor in self.SENSOR_TYPES:
+            self._callbacks[sensor] = callback
+    
+    def start(self):
+        """Inicia la recolección de datos en hilos separados."""
+        if self.running:
+            return
+        self.running = True
+        self.start_time = time.time()
+        
+        for sensor in self.SENSOR_TYPES:
+            if self.connected.get(sensor) and self.inlets.get(sensor):
+                t = threading.Thread(target=self._collect_loop, args=(sensor,), daemon=True)
+                self.threads[sensor] = t
+                t.start()
+                logger.info(f"▶️ {sensor.upper()} collection started")
+    
+    def stop(self):
+        """Detiene toda la recolección."""
+        self.running = False
+        for sensor in self.threads:
+            self.connected[sensor] = False
+        for t in self.threads.values():
+            if t.is_alive():
+                t.join(timeout=2)
+        self.threads.clear()
+        self.inlets.clear()
+        logger.info("⏹️ All sensors stopped")
+    
+    def _collect_loop(self, sensor: str):
+        """Hilo de recolección para un sensor."""
+        inlet = self.inlets[sensor]
+        while self.running and self.connected.get(sensor):
+            try:
+                sample, ts = inlet.pull_sample(timeout=1.0)
+                if sample:
+                    with self._lock:
+                        self._buffers[sensor].append({
+                            'data': list(sample),
+                            'ts': ts or time.time()
+                        })
+                        self.sample_counts[sensor] += 1
+                        self.last_sample_ts[sensor] = ts or time.time()
+                    
+                    cb = self._callbacks.get(sensor)
+                    if cb:
+                        cb(list(sample), ts or time.time())
+            except Exception as e:
+                logger.error(f"❌ {sensor.upper()} collection error: {e}")
+                time.sleep(0.5)
+                # Intentar reconectar
+                if self.running:
+                    logger.info(f"🔄 Reconnecting {sensor.upper()}...")
+                    if self.connect_sensor(sensor):
+                        inlet = self.inlets[sensor]
+                    else:
+                        self.connected[sensor] = False
+                        break
+    
+    def get_buffer(self, sensor: str, n: int = None) -> list:
+        """Obtiene las últimas n muestras de un sensor."""
+        with self._lock:
+            buf = list(self._buffers.get(sensor, []))
+        if n:
+            return buf[-n:]
+        return buf
+    
+    def get_status(self) -> dict:
+        """Retorna el estado completo de todas las conexiones."""
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        status = {
+            'running': self.running,
+            'elapsed': elapsed,
+            'sensors': {}
+        }
+        for sensor in self.SENSOR_TYPES:
+            info = self.SENSOR_TYPES[sensor]
+            buf = self._buffers.get(sensor, [])
+            with self._lock:
+                buf_list = list(buf)
+            
+            sensor_status = {
+                'connected': self.connected.get(sensor, False),
+                'type': info['lsl_type'],
+                'channels': info['channels'],
+                'nominal_rate': info['rate'],
+                'units': info['units'],
+                'samples_received': self.sample_counts.get(sensor, 0),
+                'measured_rate': self.sample_counts.get(sensor, 0) / elapsed if elapsed > 0 else 0,
+                'buffer_size': len(buf_list),
+                'last_sample_age': time.time() - self.last_sample_ts[sensor] if self.last_sample_ts.get(sensor) else None,
+            }
+            
+            if buf_list:
+                data = np.array([s['data'] for s in buf_list])
+                sensor_status['latest'] = data[-1].tolist()
+                sensor_status['mean'] = np.mean(data, axis=0).tolist()
+                sensor_status['std'] = np.std(data, axis=0).tolist()
+                sensor_status['min'] = np.min(data, axis=0).tolist()
+                sensor_status['max'] = np.max(data, axis=0).tolist()
+                sensor_status['range'] = (np.max(data, axis=0) - np.min(data, axis=0)).tolist()
+                magnitudes = np.linalg.norm(data, axis=1)
+                sensor_status['magnitude_mean'] = float(np.mean(magnitudes))
+                sensor_status['magnitude_std'] = float(np.std(magnitudes))
+                sensor_status['magnitude_latest'] = float(magnitudes[-1])
+            
+            status['sensors'][sensor] = sensor_status
+        return status
+    
+    def get_series(self, sensor: str, n: int = 100) -> dict:
+        """Obtiene series temporales para graficar: {x: [], y: [], z: []} o {ch0: [], ...}."""
+        buf = self.get_buffer(sensor, n)
+        if not buf:
+            return {}
+        data = np.array([s['data'] for s in buf])
+        series = {}
+        for i in range(data.shape[1]):
+            axis = ['x', 'y', 'z'][i] if data.shape[1] <= 3 else f'ch{i}'
+            series[axis] = data[:, i].tolist()
+        return series
 
 
 if __name__ == "__main__":
