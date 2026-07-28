@@ -261,6 +261,7 @@ The dominant band selects a timbre palette:
 The complete prompt is assembled as: \texttt{energy, mood, texture, space, instruments, instrumental, no vocals}.
 
 \subsection{Style Embedding Interpolation}
+\label{sec:style-interp}
 
 The vibe prompt is embedded into a 768-dimensional style vector via MusicCoCa's text encoder. To prevent abrupt musical shifts when the brain state changes, the style embedding is smoothly interpolated toward the target:
 
@@ -342,7 +343,7 @@ Each recording is segmented into 10-second epochs and resampled to a fixed 160 s
 
 \subsubsection{LaBraM Embeddings}
 
-We use the pretrained LaBraM transformer~\cite{labram}, a large brain model pretrained on 1,500 hours of EEG across 21 channels. The model's CLS token output (200-dimensional) serves as a learned embedding that captures both spectral and temporal patterns.
+We use the pretrained LaBraM transformer~\cite{labram}, a large brain model pretrained on approximately 2,500 hours of EEG across diverse datasets and channel montages. The model's CLS token output (200-dimensional) serves as a learned embedding that captures both spectral and temporal patterns.
 
 \subsubsection{Classical Features}
 
@@ -361,6 +362,49 @@ Embeddings are visualized using UMAP (2D, 15 neighbors) and PCA. Classification 
 LaBraM embeddings achieved 97--100\% KNN accuracy in distinguishing the three conditions, confirming that even low-sample-rate Muse data contains genre-discriminative neural signatures. Classical band-power features achieved lower accuracy due to the 16\,Hz sample rate limiting analysis to delta and partial theta bands. UMAP visualizations showed clear cluster separation for LaBraM embeddings, while classical features showed partial overlap.
 
 These results validate the core premise of Neuriphonium: brainwave activity under different musical stimuli is distinguishable, supporting the use of EEG as a control signal for music generation.
+
+\section{Cross-Modal EEG--Music Embedding Alignment}
+\label{sec:alignment}
+
+The mapping described so far is \emph{handcrafted}: band powers drive heuristically chosen descriptors and sampling parameters through a natural-language prompt intermediate. We additionally designed and implemented a \emph{learned} alignment pipeline that projects EEG directly into MusicCoCa's 768-dimensional style space---the same space that conditions Magenta RealTime 2---so that neural activity can steer generation without a text bottleneck. This section describes the architecture, the contrastive training objective, the data and protocol required to train it, and how the trained adapter integrates with the real-time system. Training on the full dataset is in progress; we report the design and protocol here.
+
+\subsection{Architecture}
+
+\paragraph{EEG encoder.}
+We use the official pretrained LaBraM transformer~\cite{labram} (12 layers, 200-dimensional embeddings). Because LaBraM's positional embeddings are tied to a canonical 128-channel layout, an arbitrary input montage is first projected onto that layout with a frozen spline-interpolation matrix computed from 3D electrode positions (via MNE). This single mechanism lets the same frozen backbone consume the 125-channel EGI HydroCel montage of the training data and the 4-channel Muse montage at inference time. The encoder's CLS token serves as the sequence-level EEG embedding.
+
+\paragraph{Alignment head.}
+A lightweight MLP projects the 200-dimensional CLS embedding into MusicCoCa space:
+\begin{equation}
+  \mathbf{z}_{\text{eeg}} = \mathrm{LayerNorm}\!\left(W_2\, \mathrm{GELU}(W_1\, \mathbf{h}_{\text{CLS}})\right), \quad \mathbf{z}_{\text{eeg}} \in \mathbb{R}^{768}
+\end{equation}
+
+\paragraph{Frozen audio target.}
+On the music side, MusicCoCa's audio tower embeds 10-second, 16\,kHz clips into 768-dimensional vectors. Since this tower remains frozen and requires no gradients, its embeddings are precomputed once over the stimulus audio using its TFLite implementation and cached to disk, keeping training memory-light.
+
+\subsection{Contrastive Objective}
+
+Training follows the CLIP recipe~\cite{clip}: within each batch of $B$ paired (EEG, audio) embeddings, both are $\ell_2$-normalized and a symmetric cross-entropy loss is applied over the scaled similarity matrix:
+\begin{equation}
+  \mathcal{L} = \frac{1}{2}\left[ \mathrm{CE}\!\left(\tau\, \mathbf{Z}_{\text{eeg}} \mathbf{Z}_{\text{audio}}^\top, \mathbf{I}\right) + \mathrm{CE}\!\left(\tau\, \mathbf{Z}_{\text{audio}} \mathbf{Z}_{\text{eeg}}^\top, \mathbf{I}\right) \right]
+\end{equation}
+where $\tau = \exp(s)$ is a learnable logit scale initialized at $1/0.07$.
+
+\subsection{Data and Training Protocol}
+
+Training requires \emph{time-aligned} (EEG, music) pairs. We use NMED-T~\cite{nmedt}: 20 participants listened to 10 full-length songs ($\sim$4 minutes each) while 125-channel EEG was recorded at 125\,Hz. Each song's EEG is $z$-scored per channel, segmented into 10-second windows, and resampled to 200\,Hz (2,000 samples) to match LaBraM's temporal patch structure; each window is paired with the MusicCoCa embedding of the temporally corresponding 10-second audio clip, yielding $\sim$4,800 training pairs. The stimulus audio itself is not redistributed with the dataset (copyright) and must be obtained separately.
+
+Generalization to unheard music is measured with a \emph{leave-songs-out} split (8 training / 2 held-out songs) and EEG$\to$audio retrieval Recall@$K$ on the held-out songs: given an EEG window, the model must rank the correct audio embedding among the top-$K$ of all candidates (chance level: $K/n$).
+
+The LaBraM backbone is frozen by default, leaving only the $\sim$1.7M-parameter head (and the temperature scalar) trainable; optionally, the last $N$ transformer blocks can be unfrozen with a reduced learning rate for adaptation. We optimize with AdamW (weight decay 0.01), cosine learning-rate decay, and gradient clipping, on Apple Silicon (MPS).
+
+\subsection{Runtime Integration}
+
+At inference, a 10-second EEG window passes through the frozen encoder and the trained head---a single forward pass costing far less than the 0.34--0.70\,s required to generate each 1-second audio chunk---and the resulting vector is fed to Magenta RealTime 2 as its style embedding, replacing the text-prompt pathway while reusing the existing interpolation mechanism (Section~\ref{sec:style-interp}) for temporal smoothing. Because the adapter's outputs live in the same space as MusicCoCa text embeddings, both control modes can also be blended linearly, letting the performer mix neurally derived and language-specified style.
+
+\subsection{Domain Gap and Subject Adaptation}
+
+The principal open challenge is the domain gap between training and deployment conditions: 125-channel research-grade EEG versus the 4-channel Muse, and 20 dataset participants versus an individual performer. The channel-interpolation layer addresses montage differences in a zero-shot manner, but we anticipate that a short subject-adaptation phase---fine-tuning the head on paired recordings of the performer listening to known stimuli---will be necessary to reach personalized alignment quality.
 
 \section{Discussion}
 
@@ -394,7 +438,7 @@ The vibe prompt builder's layered approach ensures that multiple aspects of the 
 \section{Future Work}
 
 \begin{itemize}[nosep]
-  \item \textbf{NeuroLM integration}: Exploring the use of neural language models trained on EEG data to produce richer style embeddings directly from brain activity, bypassing the text prompt intermediate.
+  \item \textbf{Alignment training and subject adaptation}: Completing NMED-T training of the cross-modal aligner (Section~\ref{sec:alignment}), reporting leave-songs-out retrieval performance, and validating the zero-shot transfer from 125-channel EGI to 4-channel Muse, including the subject-adaptation phase with paired performer recordings.
   \item \textbf{Notes conditioning}: Magenta RT 2 supports 128-dimensional notes conditioning (per-pitch on/off/mask), which could be mapped from specific EEG features to control melodic content.
   \item \textbf{Multi-performer extension}: Extending the system to incorporate inter-brain synchrony between multiple performers, as in BrainiBeats~\cite{brainibeats2023}.
   \item \textbf{Formal evaluation}: Conducting user studies with musicians to evaluate the system's effectiveness in improvisational settings, measuring both musical quality and performer experience.
@@ -451,6 +495,12 @@ Q.~Huang, A.~Jansen, J.~Lee, R.~Ganti, J.~Y. Li, and D.~P.~W. Ellis, ``MuLan: A 
 
 \bibitem{labram}
 W.-B. Jiang, L.-M. Zhao, and B.-L. Lu, ``Large brain model for learning generic representations with tremendous EEG data in BCI,'' in \textit{Proc. ICLR '24}, 2024.
+
+\bibitem{clip}
+A.~Radford, J.~W. Kim, C.~Hallacy, A.~Ramesh, G.~Goh, S.~Agarwal, et al., ``Learning transferable visual models from natural language supervision,'' in \textit{Proc. ICML '21}, 2021.
+
+\bibitem{nmedt}
+S.~Losorelli, D.~T. Nguyen, J.~P. Dmochowski, and B.~Kaneshiro, ``NMED-T: A tempo-focused dataset of cortical and behavioral responses to naturalistic music,'' in \textit{Proc. ISMIR '17}, 2017.
 
 \bibitem{decharms2005}
 R.~C. deCharms, F.~Maeda, G.~H. Glover, D.~Ludlow, J.~M. Pauly, D.~Soneji, J.~D.~E. Gabrieli, and S.~C. Mackey, ``Control over brain activation and pain learned by using real-time functional MRI,'' \textit{PNAS}, vol.~102, no.~51, pp.~18626--18631, 2005.

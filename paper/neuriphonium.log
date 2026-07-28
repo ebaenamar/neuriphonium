@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.3.8)  26 JUL 2026 10:34
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.3.8)  28 JUL 2026 15:45
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -1129,7 +1129,7 @@ Underfull \vbox (badness 10000) has occurred while \output is active []
 
 
 [2.2]
-<architecture.png, id=162, 740.0448pt x 851.3406pt>
+<architecture.png, id=186, 740.0448pt x 851.3406pt>
 File: architecture.png Graphic file (type png)
 <use architecture.png>
 Package pdftex.def Info: architecture.png  used on input line 94.
@@ -1179,11 +1179,11 @@ LaTeX Warning: Text page 4 contains only floats.
 
 [6.6]
 LaTeX Font Info:    Font shape `OT1/LinuxLibertineT-TLF/sb/n' will be
-(Font)              scaled to size 9.0pt on input line 268.
+(Font)              scaled to size 9.0pt on input line 269.
 LaTeX Font Info:    Font shape `OT1/LinuxLibertineT-TLF/sb/n' will be
-(Font)              scaled to size 6.6pt on input line 268.
+(Font)              scaled to size 6.6pt on input line 269.
 LaTeX Font Info:    Font shape `OT1/LinuxLibertineT-TLF/sb/n' will be
-(Font)              scaled to size 5.5pt on input line 268.
+(Font)              scaled to size 5.5pt on input line 269.
 
 Underfull \vbox (badness 2310) has occurred while \output is active []
 
@@ -1194,13 +1194,10 @@ nc}] (/usr/local/texlive/2025/texmf-dist/tex/latex/listings/lstlang1.sty
 File: lstlang1.sty 2024/09/23 1.10c listings language file
 )
 LaTeX Font Info:    Font shape `T1/zi4/m/n' will be
-(Font)              scaled to size 8.0pt on input line 295.
+(Font)              scaled to size 8.0pt on input line 296.
 
 
 [8.8]
-Underfull \vbox (badness 10000) has occurred while \output is active []
-
-
 
 [9.9]
 Underfull \vbox (badness 10000) has occurred while \output is active []
@@ -1208,11 +1205,18 @@ Underfull \vbox (badness 10000) has occurred while \output is active []
 
 
 [10.10]
-LaTeX Font Info:    Font shape `T1/LinuxLibertineT-TLF/m/it' will be
-(Font)              scaled to size 7.0pt on input line 411.
-LaTeX Font Info:    Font shape `OT1/LinuxLibertineT-TLF/sb/n' will be
-(Font)              scaled to size 7.3pt on input line 438.
+Underfull \vbox (badness 1199) has occurred while \output is active []
 
+
+
+[11.11]
+LaTeX Font Info:    Font shape `T1/LinuxLibertineT-TLF/m/it' will be
+(Font)              scaled to size 7.0pt on input line 455.
+LaTeX Font Info:    Font shape `OT1/LinuxLibertineT-TLF/sb/n' will be
+(Font)              scaled to size 7.3pt on input line 482.
+
+
+[12.12]
 
 Class acmart Warning: Some images may lack descriptions.
 
@@ -1223,23 +1227,23 @@ File: se-pdfdoc.def 2019/11/29 v1.12 stringenc: PDFDocEncoding
 )
 (/usr/local/texlive/2025/texmf-dist/tex/generic/stringenc/se-utf8.def
 File: se-utf8.def 2019/11/29 v1.12 stringenc: UTF-8
-) [11.11]
+) [13.13]
 (./neuriphonium.aux)
  ***********
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
  ***********
 Package rerunfilecheck Info: File `neuriphonium.out' has not changed.
-(rerunfilecheck)             Checksum: 0CFCED458713042354EBBC63BFC345A0;4680.
+(rerunfilecheck)             Checksum: D8C688B785779EFE5CA51664DF5A8141;5941.
  ) 
 Here is how much of TeX's memory you used:
- 23568 strings out of 473190
- 377540 string characters out of 5715801
- 1057611 words of memory out of 5000000
- 45709 multiletter control sequences out of 15000+600000
- 746481 words of font info for 414 fonts, out of 8000000 for 9000
+ 23597 strings out of 473190
+ 377906 string characters out of 5715801
+ 1057771 words of memory out of 5000000
+ 45723 multiletter control sequences out of 15000+600000
+ 746364 words of font info for 414 fonts, out of 8000000 for 9000
  1302 hyphenation exceptions out of 8191
- 90i,17n,131p,1688b,1376s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 90i,16n,131p,1688b,1376s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/local/texlive/2025/texmf-dist/fonts/type1/public/inconsolata/Inconsolat
 a-zi4r.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/Liberti
 neMathMI.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/Liber
@@ -1254,11 +1258,12 @@ nts/type1/public/libertine/LinLibertineTZ.pfb></usr/local/texlive/2025/texmf-di
 st/fonts/type1/public/newtx/NewTXMI.pfb></usr/local/texlive/2025/texmf-dist/fon
 ts/type1/public/newtx/txexs.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1
 /public/newtx/txmiaX.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public
-/newtx/txsys.pfb>
-Output written on neuriphonium.pdf (11 pages, 1051686 bytes).
+/newtx/txsym.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/t
+xsys.pfb>
+Output written on neuriphonium.pdf (13 pages, 1073792 bytes).
 PDF statistics:
- 372 PDF objects out of 1000 (max. 8388607)
- 320 compressed objects within 4 object streams
- 109 named destinations out of 1000 (max. 500000)
- 109806 words of extra memory for PDF output out of 128383 (max. 10000000)
+ 424 PDF objects out of 1000 (max. 8388607)
+ 368 compressed objects within 4 object streams
+ 124 named destinations out of 1000 (max. 500000)
+ 109854 words of extra memory for PDF output out of 128383 (max. 10000000)
 
