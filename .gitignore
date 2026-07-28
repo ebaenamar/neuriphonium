@@ -7,3 +7,5 @@ output/
 *.wav
 *.mp3
 *.csv
+.DS_Store
+EEG-to-Music/
