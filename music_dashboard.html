@@ -308,11 +308,13 @@
                 </div>
                 
                 <div class="music-controls">
-                    <button class="btn-start" id="btn-start" onclick="startMusic()">▶️ Start Music</button>
+                    <button class="btn-start" id="btn-start" onclick="startMusic()" disabled>▶️ Start Music</button>
                     <button class="btn-stop" id="btn-stop" onclick="stopMusic()" disabled>⏹️ Stop</button>
                 </div>
                 
-                <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:15px;">🔄 Reset Baseline</button>
+                <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:10px;">🔄 Reset Baseline</button>
+                <button class="btn-reset" id="btn-muse" onclick="startMuseStream()" style="width:100%; margin-bottom:15px;">📡 Start Muse Stream</button>
+                <div id="muse-status" style="text-align:center; font-size:0.8em; margin-bottom:10px; opacity:0.7;">Muse: Not connected</div>
                 
                 <div class="music-status">
                     <div class="music-param">
@@ -493,6 +495,8 @@
                     document.getElementById('music-status').classList.add('generating');
                     document.getElementById('gen-status').textContent = 'Buffering...';
                     addLog('🎵 Music started - buffering audio...', 'change');
+                } else if (data.type === 'muse_status') {
+                    updateMuseStatus(data.connected);
                 } else if (data.type === 'music_stopped') {
                     isGenerating = false;
                     stopAudio();
@@ -509,29 +513,26 @@
             };
         }
         
+        let lastChartUpdate = 0;
         function updateEEG(data) {
             const bands = data.bands;
             const metrics = data.metrics;
             const music = data.music_params;
             
-            // Bands
+            // Always accumulate band history (cheap)
             for (const band of ['delta', 'theta', 'alpha', 'beta', 'gamma']) {
                 const val = bands[band] || 0;
-                document.getElementById(`${band}-bar`).style.width = `${val * 100}%`;
-                document.getElementById(`${band}-val`).textContent = val.toFixed(2);
                 bandHistory[band].push(val);
                 if (bandHistory[band].length > maxHistory) bandHistory[band].shift();
             }
             
-            // Chart
-            bandChart.data.datasets[0].data = bandHistory.delta;
-            bandChart.data.datasets[1].data = bandHistory.theta;
-            bandChart.data.datasets[2].data = bandHistory.alpha;
-            bandChart.data.datasets[3].data = bandHistory.beta;
-            bandChart.data.datasets[4].data = bandHistory.gamma;
-            bandChart.update('none');
+            // Update bars + text on every message (~1/s, very cheap)
+            for (const band of ['delta', 'theta', 'alpha', 'beta', 'gamma']) {
+                const val = bands[band] || 0;
+                document.getElementById(`${band}-bar`).style.width = `${val * 100}%`;
+                document.getElementById(`${band}-val`).textContent = val.toFixed(2);
+            }
             
-            // Metrics
             const adj_a = metrics.arousal_adjusted || metrics.arousal;
             const adj_v = metrics.valence_adjusted || metrics.valence;
             document.getElementById('arousal-val').textContent = adj_a.toFixed(2);
@@ -539,18 +540,12 @@
             document.getElementById('focus-val').textContent = (metrics.focus_adjusted || metrics.focus).toFixed(2);
             document.getElementById('relax-val').textContent = (metrics.relaxation_adjusted || metrics.relaxation).toFixed(2);
             
-            // Dominant band
             const bandMap = {delta: 'δ', theta: 'θ', alpha: 'α', beta: 'β', gamma: 'γ'};
             const dominant = Object.keys(bands).reduce((a, b) => bands[a] > bands[b] ? a : b);
             document.getElementById('dominant-val').textContent = bandMap[dominant];
-            
-            // Change indicator
             document.getElementById('change-val').textContent = metrics.significant_change ? '🔄' : '-';
-            
-            // State
             updateState(metrics);
             
-            // Music params
             if (music) {
                 document.getElementById('param-bpm').textContent = music.bpm;
                 document.getElementById('param-scale').textContent = formatScale(music.scale);
@@ -562,6 +557,18 @@
             
             if (data.prompt) {
                 document.getElementById('current-prompt').textContent = data.prompt;
+            }
+            
+            // Update chart every 2s (Chart.js re-render is expensive)
+            const now = Date.now();
+            if (now - lastChartUpdate >= 2000) {
+                lastChartUpdate = now;
+                bandChart.data.datasets[0].data = bandHistory.delta;
+                bandChart.data.datasets[1].data = bandHistory.theta;
+                bandChart.data.datasets[2].data = bandHistory.alpha;
+                bandChart.data.datasets[3].data = bandHistory.beta;
+                bandChart.data.datasets[4].data = bandHistory.gamma;
+                bandChart.update('none');
             }
         }
         
@@ -628,7 +635,45 @@
             addLog('🔄 Resetting baseline...', 'change');
         }
         
+        let museStreamRunning = false;
+        let museConnected = false;
+        function startMuseStream() {
+            if (museStreamRunning) {
+                addLog('Muse stream already running');
+                return;
+            }
+            museStreamRunning = true;
+            const btn = document.getElementById('btn-muse');
+            btn.disabled = true;
+            btn.textContent = '📡 Starting Muse...';
+            ws.send(JSON.stringify({ action: 'start_muse' }));
+            addLog('📡 Starting muselsl stream...', 'change');
+        }
+        
+        function updateMuseStatus(connected) {
+            museConnected = connected;
+            const el = document.getElementById('muse-status');
+            const btn = document.getElementById('btn-muse');
+            if (connected) {
+                el.textContent = 'Muse: ✅ Connected';
+                el.style.color = '#4ecdc4';
+                el.style.opacity = '1';
+                document.getElementById('btn-start').disabled = false;
+                btn.disabled = true;
+                btn.textContent = '📡 Muse Active';
+            } else {
+                el.textContent = 'Muse: ❌ Not connected';
+                el.style.color = '#e74c3c';
+                el.style.opacity = '1';
+                document.getElementById('btn-start').disabled = true;
+                btn.disabled = false;
+                btn.textContent = '📡 Start Muse Stream';
+                museStreamRunning = false;
+            }
+        }
+        
         // ============ SENSITIVITY CONTROLS ============
+        let settingsDebounce = null;
         function updateSensitivity() {
             const settings = {
                 band_sensitivity: {
@@ -642,7 +687,7 @@
                 global_sensitivity: document.getElementById('global-sens').value / 100
             };
             
-            // Update display values
+            // Update display values immediately
             document.getElementById('sens-delta-val').textContent = settings.band_sensitivity.delta.toFixed(1) + 'x';
             document.getElementById('sens-theta-val').textContent = settings.band_sensitivity.theta.toFixed(1) + 'x';
             document.getElementById('sens-alpha-val').textContent = settings.band_sensitivity.alpha.toFixed(1) + 'x';
@@ -651,8 +696,12 @@
             document.getElementById('smoothing-val').textContent = settings.smoothing;
             document.getElementById('global-sens-val').textContent = settings.global_sensitivity.toFixed(1) + 'x';
             
-            // Send to server
-            ws.send(JSON.stringify({ action: 'update_settings', settings: settings }));
+            // Debounce sending to server (300ms after last slider movement)
+            if (settingsDebounce) clearTimeout(settingsDebounce);
+            settingsDebounce = setTimeout(() => {
+                ws.send(JSON.stringify({ action: 'update_settings', settings: settings }));
+                settingsDebounce = null;
+            }, 300);
         }
         
         function resetSliders() {
@@ -692,9 +741,14 @@
         let audioQueue = [];
         let isPlaying = false;
         let nextPlayTime = 0;
-        const BUFFER_SECONDS = 3; // Buffer before starting playback
+        const BUFFER_SECONDS = 6; // Buffer before starting playback
         let totalBufferedSeconds = 0;
         let playbackStarted = false;
+        let chunkCount = 0;
+        let gapCount = 0;
+        let lastChunkTime = 0;
+        let backendThrottled = false;
+        const AUDIO_DEBUG = true; // Set to true for audio pipeline debugging logs
         
         function initAudio() {
             if (!audioContext) {
@@ -711,64 +765,163 @@
         function handleAudioChunk(data) {
             if (!audioContext) initAudio();
             
-            // Decode base64 to ArrayBuffer
+            const now = performance.now();
+            chunkCount++;
+            const interChunkMs = lastChunkTime > 0 ? (now - lastChunkTime).toFixed(0) : '-';
+            lastChunkTime = now;
+            
+            // Fast base64 decode: use atob + Uint8Array from char codes in chunks
             const binaryString = atob(data.data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i += 8192) {
+                const end = Math.min(i + 8192, len);
+                for (let j = i; j < end; j++) {
+                    bytes[j] = binaryString.charCodeAt(j);
+                }
             }
             
-            // Convert Int16 PCM to Float32
-            const int16Array = new Int16Array(bytes.buffer);
-            const float32Array = new Float32Array(int16Array.length);
-            for (let i = 0; i < int16Array.length; i++) {
-                float32Array[i] = int16Array[i] / 32768.0;
-            }
-            
-            // Create audio buffer (stereo)
-            const numSamples = float32Array.length / 2;
+            // Convert Int16 PCM to Float32 stereo using DataView (fast, no intermediate array)
+            const int16View = new Int16Array(bytes.buffer);
+            const numSamples = int16View.length / 2;
             const audioBuffer = audioContext.createBuffer(2, numSamples, 48000);
-            
-            // Deinterleave stereo channels
             const leftChannel = audioBuffer.getChannelData(0);
             const rightChannel = audioBuffer.getChannelData(1);
+            
             for (let i = 0; i < numSamples; i++) {
-                leftChannel[i] = float32Array[i * 2];
-                rightChannel[i] = float32Array[i * 2 + 1];
+                leftChannel[i] = int16View[i * 2] / 32768.0;
+                rightChannel[i] = int16View[i * 2 + 1] / 32768.0;
             }
             
             // Add to queue
             audioQueue.push(audioBuffer);
             totalBufferedSeconds += audioBuffer.duration;
             
+            // Logging: chunk arrival stats (only in debug mode)
+            if (AUDIO_DEBUG && chunkCount % 10 === 0) {
+                const scheduledAhead = nextPlayTime > 0 ? (nextPlayTime - audioContext.currentTime).toFixed(2) : '0';
+                console.log(`[AUDIO] chunk#${chunkCount} | inter-chunk: ${interChunkMs}ms | queue: ${audioQueue.length} | ahead: ${scheduledAhead}s`);
+            }
+            
             // Start playback after buffering enough
             if (!playbackStarted && totalBufferedSeconds >= BUFFER_SECONDS) {
                 playbackStarted = true;
                 nextPlayTime = audioContext.currentTime + 0.1;
-                scheduleBuffers();
                 addLog('🔊 Playback started!', 'change');
+                if (AUDIO_DEBUG) console.log(`[AUDIO] === PLAYBACK STARTED === queue=${audioQueue.length} buffered=${totalBufferedSeconds.toFixed(1)}s`);
+            }
+            
+            // Always ensure scheduler is running when we have audio
+            if (playbackStarted) {
+                startScheduler();
             }
         }
         
+        let schedulerInterval = null;
+        
         function scheduleBuffers() {
+            if (!audioContext || !playbackStarted) return;
+            
+            // Auto-resume if browser suspended the context
+            if (audioContext.state === 'suspended') {
+            if (AUDIO_DEBUG) console.warn('[AUDIO] ⚠️ AudioContext SUSPENDED — attempting resume');
+                audioContext.resume();
+                return;
+            }
+            
             // If we fell behind realtime, catch up to avoid gaps
             if (nextPlayTime < audioContext.currentTime) {
+                const gapSec = (audioContext.currentTime - nextPlayTime).toFixed(3);
+                gapCount++;
+            if (AUDIO_DEBUG) console.warn(`[AUDIO] ⚠️ GAP #${gapCount} detected! nextPlayTime was ${gapSec}s behind currentTime. Resetting. queue=${audioQueue.length}`);
                 nextPlayTime = audioContext.currentTime + 0.05;
             }
-            // Schedule up to 10s ahead for smooth playback
-            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + 10) {
+            // Schedule up to 3s ahead for low latency
+            const LOOKAHEAD = 3.0;
+            const CROSSFADE_MS = 10;
+            const crossfadeTime = CROSSFADE_MS / 1000;
+            let scheduledThisRun = 0;
+            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + LOOKAHEAD) {
                 const buffer = audioQueue.shift();
                 const source = audioContext.createBufferSource();
                 source.buffer = buffer;
-                source.connect(audioContext.destination);
-                source.start(nextPlayTime);
-                nextPlayTime += buffer.duration;
+                
+                // Crossfade: fade-in at start, fade-out at end
+                const gain = audioContext.createGain();
+                const startTime = nextPlayTime;
+                const endTime = startTime + buffer.duration;
+                
+                gain.gain.setValueAtTime(0, startTime);
+                gain.gain.linearRampToValueAtTime(1, startTime + crossfadeTime);
+                gain.gain.setValueAtTime(1, endTime - crossfadeTime);
+                gain.gain.linearRampToValueAtTime(0, endTime);
+                
+                source.connect(gain);
+                gain.connect(audioContext.destination);
+                source.start(startTime);
+                source.onended = function() {
+                    gain.disconnect();
+                    source.disconnect();
+                };
+                nextPlayTime = endTime - crossfadeTime;
+                scheduledThisRun++;
             }
-            
-            if (isGenerating || audioQueue.length > 0) {
-                setTimeout(scheduleBuffers, 20);
+            if (AUDIO_DEBUG && scheduledThisRun > 0 && chunkCount % 10 === 0) {
+                const ahead = (nextPlayTime - audioContext.currentTime).toFixed(2);
+                console.log(`[SCHED] scheduled ${scheduledThisRun} | queue: ${audioQueue.length} | ahead: ${ahead}s | gaps: ${gapCount}`);
+            }
+            // Throttle backend: tell it to pause if queue is large, resume if small
+            if (ws && ws.readyState === 1) {
+                if (audioQueue.length > 10 && !backendThrottled) {
+                    backendThrottled = true;
+                    ws.send(JSON.stringify({ action: 'throttle', throttled: true }));
+                if (AUDIO_DEBUG) console.log('[THROTTLE] telling backend to PAUSE generation');
+                } else if (audioQueue.length < 5 && backendThrottled) {
+                    backendThrottled = false;
+                    ws.send(JSON.stringify({ action: 'throttle', throttled: false }));
+                if (AUDIO_DEBUG) console.log('[THROTTLE] telling backend to RESUME generation');
+                }
+            }
+            // Warn if queue is empty and we're still generating (only in debug mode)
+            if (AUDIO_DEBUG && audioQueue.length === 0 && isGenerating && chunkCount % 10 === 0) {
+                const ahead = (nextPlayTime - audioContext.currentTime).toFixed(2);
+                if (parseFloat(ahead) < 1.0) {
+                    console.warn(`[SCHED] ⚠️ QUEUE EMPTY! ahead=${ahead}s`);
+                }
             }
         }
+        
+        function startScheduler() {
+            if (schedulerInterval) return;
+            schedulerInterval = setInterval(() => {
+                if (!playbackStarted || !audioContext) {
+                    clearInterval(schedulerInterval);
+                    schedulerInterval = null;
+                    return;
+                }
+                scheduleBuffers();
+            }, 50);
+        }
+        
+        // Report stats to backend every 3s for monitoring
+        setInterval(() => {
+            if (playbackStarted && ws && ws.readyState === 1) {
+                const ahead = nextPlayTime > 0 && audioContext ? (nextPlayTime - audioContext.currentTime).toFixed(2) : '0';
+                ws.send(JSON.stringify({
+                    action: 'frontend_stats',
+                    stats: {
+                        chunkCount,
+                        gapCount,
+                        queueLen: audioQueue.length,
+                        bufferedSec: totalBufferedSeconds.toFixed(1),
+                        scheduledAhead: ahead,
+                        playbackStarted,
+                        ctxTime: audioContext ? audioContext.currentTime.toFixed(2) : '0',
+                        ctxState: audioContext ? audioContext.state : 'none',
+                    }
+                }));
+            }
+        }, 3000);
         
         function handleMP3Clip(data) {
             if (!audioContext) initAudio();
@@ -796,9 +949,17 @@
         }
         
         function stopAudio() {
+            if (AUDIO_DEBUG) console.log(`[AUDIO] === STOP === total chunks: ${chunkCount} | total gaps: ${gapCount} | queue remaining: ${audioQueue.length}`);
             audioQueue = [];
             playbackStarted = false;
             totalBufferedSeconds = 0;
+            chunkCount = 0;
+            gapCount = 0;
+            lastChunkTime = 0;
+            if (schedulerInterval) {
+                clearInterval(schedulerInterval);
+                schedulerInterval = null;
+            }
             if (audioContext) {
                 audioContext.close();
                 audioContext = null;

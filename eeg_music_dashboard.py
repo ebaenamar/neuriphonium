@@ -267,6 +267,7 @@ class MusicGenerator:
         self._style_blend = 0.4  # Faster style movement (was 0.15, too slow)
         self._vibe_history = deque(maxlen=10)
         self._tflite_lock = threading.Lock()  # TFLite interpreters aren't thread-safe
+        self._throttled = False  # Backend throttle flag set by frontend
         
         logger.info("🧠 Cargando modelo local Magenta RealTime 2 (mrt2_small)...")
         from magenta_rt.mlx.system import MagentaRT2SystemMlxfn
@@ -437,17 +438,19 @@ class MusicGenerator:
             # Temperature: wide range, driven by theta/alpha contrast
             # theta high = creative/unpredictable, alpha high = stable/consonant
             # arousal adds energy, delta adds gravity
+            # Cap at 2.0 — higher values cause noise/silence from Magenta
             theta_alpha_ratio = theta / (alpha + 0.01)
             target_temp = np.clip(
                 0.5 + theta_alpha_ratio * 1.2 + arousal * 0.8 - delta * 0.4,
-                0.3, 3.0
+                0.3, 2.0
             )
             
             # Top-k: gamma/beta contrast drives variety vs precision
+            # Cap at 50 — higher values with high temp cause noise
             gamma_beta_ratio = gamma / (beta + 0.01)
             target_top_k = int(np.clip(
                 10 + gamma_beta_ratio * 30 + arousal * 20 - focus * 15,
-                5, 100
+                5, 50
             ))
             
             # Faster interpolation — respond to brain changes quickly
@@ -458,13 +461,12 @@ class MusicGenerator:
             # CFG guidance: how strongly generation follows the style prompt.
             # Default (3.0) is weak -> generic/flat sound. Focus+arousal push it
             # up to 6.5 for punchier, more expressive adherence to the vibe.
-            target_cfg = np.clip(2.0 + focus * 2.5 + arousal * 2.0, 1.5, 6.5)
+            target_cfg = np.clip(2.5 + focus * 2.5 + arousal * 2.0, 2.5, 6.5)
             self._gen_cfg_musiccoca = self._gen_cfg_musiccoca * (1 - temp_blend) + target_cfg * temp_blend
             
-            # Drums: force on above an arousal threshold to add rhythmic movement.
-            # Below threshold, leave masked (None) so the model decides freely
-            # instead of forcing silence (which flattens the sound further).
-            self._gen_drums = [1] if arousal > 0.4 else None
+            # Drums: always on to maintain rhythmic presence.
+            # None can cause Magenta to generate silence/ambient noise.
+            self._gen_drums = [1]
             
             # --- Build vibe prompt and compute target style embedding ---
             vibe_prompt = self._build_vibe_prompt(params)
@@ -529,7 +531,7 @@ class MusicGenerator:
                 chunk_count += 1
                 self.audio_chunks.append(chunk_data)
                 
-                if chunk_count % 5 == 0:
+                if chunk_count % 50 == 0:
                     logger.info(f"🎵 Chunk {chunk_count}: {generation_time:.2f}s gen / {step_duration:.1f}s audio (ratio {realtime_ratio:.2f}x) | temp={self._gen_temperature:.2f} top_k={self._gen_top_k} cfg={self._gen_cfg_musiccoca:.2f} drums={self._gen_drums}")
                     
                 if self.audio_callback:
@@ -538,7 +540,8 @@ class MusicGenerator:
                         'type': 'audio',
                         'data': audio_b64,
                         'sample_rate': SAMPLE_RATE_AUDIO,
-                        'channels': CHANNELS
+                        'channels': CHANNELS,
+                        'chunk_id': chunk_count,
                     })
                     
                 total_bytes = sum(len(c) for c in self.audio_chunks)
@@ -547,7 +550,11 @@ class MusicGenerator:
                 if self.buffer_progress >= 100:
                     self.buffer_ready = True
                 
-                await asyncio.sleep(0)
+                # If frontend says we have enough buffered, wait before generating more
+                if self._throttled:
+                    await asyncio.sleep(0.5)
+                else:
+                    await asyncio.sleep(0)
                 
             logger.info(f"Bucle local finalizado. Total de chunks generados: {chunk_count}")
         except Exception as e:
@@ -1035,11 +1042,13 @@ DASHBOARD_HTML = """
                 </div>
                 
                 <div class="music-controls">
-                    <button class="btn-start" id="btn-start" onclick="startMusic()">▶️ Start Music</button>
+                    <button class="btn-start" id="btn-start" onclick="startMusic()" disabled>▶️ Start Music</button>
                     <button class="btn-stop" id="btn-stop" onclick="stopMusic()" disabled>⏹️ Stop</button>
                 </div>
                 
-                <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:15px;">🔄 Reset Baseline</button>
+                <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:10px;">🔄 Reset Baseline</button>
+                <button class="btn-reset" id="btn-muse" onclick="startMuseStream()" style="width:100%; margin-bottom:15px;">📡 Start Muse Stream</button>
+                <div id="muse-status" style="text-align:center; font-size:0.8em; margin-bottom:10px; opacity:0.7;">Muse: Not connected</div>
                 
                 <div class="music-status">
                     <div class="music-param">
@@ -1220,6 +1229,8 @@ DASHBOARD_HTML = """
                     document.getElementById('music-status').classList.add('generating');
                     document.getElementById('gen-status').textContent = 'Buffering...';
                     addLog('🎵 Music started - buffering audio...', 'change');
+                } else if (data.type === 'muse_status') {
+                    updateMuseStatus(data.connected);
                 } else if (data.type === 'music_stopped') {
                     isGenerating = false;
                     stopAudio();
@@ -1236,29 +1247,26 @@ DASHBOARD_HTML = """
             };
         }
         
+        let lastChartUpdate = 0;
         function updateEEG(data) {
             const bands = data.bands;
             const metrics = data.metrics;
             const music = data.music_params;
             
-            // Bands
+            // Always accumulate band history (cheap)
             for (const band of ['delta', 'theta', 'alpha', 'beta', 'gamma']) {
                 const val = bands[band] || 0;
-                document.getElementById(`${band}-bar`).style.width = `${val * 100}%`;
-                document.getElementById(`${band}-val`).textContent = val.toFixed(2);
                 bandHistory[band].push(val);
                 if (bandHistory[band].length > maxHistory) bandHistory[band].shift();
             }
             
-            // Chart
-            bandChart.data.datasets[0].data = bandHistory.delta;
-            bandChart.data.datasets[1].data = bandHistory.theta;
-            bandChart.data.datasets[2].data = bandHistory.alpha;
-            bandChart.data.datasets[3].data = bandHistory.beta;
-            bandChart.data.datasets[4].data = bandHistory.gamma;
-            bandChart.update('none');
+            // Update bars + text on every message (~1/s, very cheap)
+            for (const band of ['delta', 'theta', 'alpha', 'beta', 'gamma']) {
+                const val = bands[band] || 0;
+                document.getElementById(`${band}-bar`).style.width = `${val * 100}%`;
+                document.getElementById(`${band}-val`).textContent = val.toFixed(2);
+            }
             
-            // Metrics
             const adj_a = metrics.arousal_adjusted || metrics.arousal;
             const adj_v = metrics.valence_adjusted || metrics.valence;
             document.getElementById('arousal-val').textContent = adj_a.toFixed(2);
@@ -1266,18 +1274,12 @@ DASHBOARD_HTML = """
             document.getElementById('focus-val').textContent = (metrics.focus_adjusted || metrics.focus).toFixed(2);
             document.getElementById('relax-val').textContent = (metrics.relaxation_adjusted || metrics.relaxation).toFixed(2);
             
-            // Dominant band
             const bandMap = {delta: 'δ', theta: 'θ', alpha: 'α', beta: 'β', gamma: 'γ'};
             const dominant = Object.keys(bands).reduce((a, b) => bands[a] > bands[b] ? a : b);
             document.getElementById('dominant-val').textContent = bandMap[dominant];
-            
-            // Change indicator
             document.getElementById('change-val').textContent = metrics.significant_change ? '🔄' : '-';
-            
-            // State
             updateState(metrics);
             
-            // Music params
             if (music) {
                 document.getElementById('param-bpm').textContent = music.bpm;
                 document.getElementById('param-scale').textContent = formatScale(music.scale);
@@ -1289,6 +1291,18 @@ DASHBOARD_HTML = """
             
             if (data.prompt) {
                 document.getElementById('current-prompt').textContent = data.prompt;
+            }
+            
+            // Update chart every 2s (Chart.js re-render is expensive)
+            const now = Date.now();
+            if (now - lastChartUpdate >= 2000) {
+                lastChartUpdate = now;
+                bandChart.data.datasets[0].data = bandHistory.delta;
+                bandChart.data.datasets[1].data = bandHistory.theta;
+                bandChart.data.datasets[2].data = bandHistory.alpha;
+                bandChart.data.datasets[3].data = bandHistory.beta;
+                bandChart.data.datasets[4].data = bandHistory.gamma;
+                bandChart.update('none');
             }
         }
         
@@ -1355,7 +1369,45 @@ DASHBOARD_HTML = """
             addLog('🔄 Resetting baseline...', 'change');
         }
         
+        let museStreamRunning = false;
+        let museConnected = false;
+        function startMuseStream() {
+            if (museStreamRunning) {
+                addLog('Muse stream already running');
+                return;
+            }
+            museStreamRunning = true;
+            const btn = document.getElementById('btn-muse');
+            btn.disabled = true;
+            btn.textContent = '📡 Starting Muse...';
+            ws.send(JSON.stringify({ action: 'start_muse' }));
+            addLog('📡 Starting muselsl stream...', 'change');
+        }
+        
+        function updateMuseStatus(connected) {
+            museConnected = connected;
+            const el = document.getElementById('muse-status');
+            const btn = document.getElementById('btn-muse');
+            if (connected) {
+                el.textContent = 'Muse: ✅ Connected';
+                el.style.color = '#4ecdc4';
+                el.style.opacity = '1';
+                document.getElementById('btn-start').disabled = false;
+                btn.disabled = true;
+                btn.textContent = '📡 Muse Active';
+            } else {
+                el.textContent = 'Muse: ❌ Not connected';
+                el.style.color = '#e74c3c';
+                el.style.opacity = '1';
+                document.getElementById('btn-start').disabled = true;
+                btn.disabled = false;
+                btn.textContent = '📡 Start Muse Stream';
+                museStreamRunning = false;
+            }
+        }
+        
         // ============ SENSITIVITY CONTROLS ============
+        let settingsDebounce = null;
         function updateSensitivity() {
             const settings = {
                 band_sensitivity: {
@@ -1369,7 +1421,7 @@ DASHBOARD_HTML = """
                 global_sensitivity: document.getElementById('global-sens').value / 100
             };
             
-            // Update display values
+            // Update display values immediately
             document.getElementById('sens-delta-val').textContent = settings.band_sensitivity.delta.toFixed(1) + 'x';
             document.getElementById('sens-theta-val').textContent = settings.band_sensitivity.theta.toFixed(1) + 'x';
             document.getElementById('sens-alpha-val').textContent = settings.band_sensitivity.alpha.toFixed(1) + 'x';
@@ -1378,8 +1430,12 @@ DASHBOARD_HTML = """
             document.getElementById('smoothing-val').textContent = settings.smoothing;
             document.getElementById('global-sens-val').textContent = settings.global_sensitivity.toFixed(1) + 'x';
             
-            // Send to server
-            ws.send(JSON.stringify({ action: 'update_settings', settings: settings }));
+            // Debounce sending to server (300ms after last slider movement)
+            if (settingsDebounce) clearTimeout(settingsDebounce);
+            settingsDebounce = setTimeout(() => {
+                ws.send(JSON.stringify({ action: 'update_settings', settings: settings }));
+                settingsDebounce = null;
+            }, 300);
         }
         
         function resetSliders() {
@@ -1419,9 +1475,14 @@ DASHBOARD_HTML = """
         let audioQueue = [];
         let isPlaying = false;
         let nextPlayTime = 0;
-        const BUFFER_SECONDS = 3; // Buffer before starting playback
+        const BUFFER_SECONDS = 6; // Buffer before starting playback
         let totalBufferedSeconds = 0;
         let playbackStarted = false;
+        let chunkCount = 0;
+        let gapCount = 0;
+        let lastChunkTime = 0;
+        let backendThrottled = false;
+        const AUDIO_DEBUG = true; // Set to true for audio pipeline debugging logs
         
         function initAudio() {
             if (!audioContext) {
@@ -1438,64 +1499,163 @@ DASHBOARD_HTML = """
         function handleAudioChunk(data) {
             if (!audioContext) initAudio();
             
-            // Decode base64 to ArrayBuffer
+            const now = performance.now();
+            chunkCount++;
+            const interChunkMs = lastChunkTime > 0 ? (now - lastChunkTime).toFixed(0) : '-';
+            lastChunkTime = now;
+            
+            // Fast base64 decode: use atob + Uint8Array from char codes in chunks
             const binaryString = atob(data.data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i += 8192) {
+                const end = Math.min(i + 8192, len);
+                for (let j = i; j < end; j++) {
+                    bytes[j] = binaryString.charCodeAt(j);
+                }
             }
             
-            // Convert Int16 PCM to Float32
-            const int16Array = new Int16Array(bytes.buffer);
-            const float32Array = new Float32Array(int16Array.length);
-            for (let i = 0; i < int16Array.length; i++) {
-                float32Array[i] = int16Array[i] / 32768.0;
-            }
-            
-            // Create audio buffer (stereo)
-            const numSamples = float32Array.length / 2;
+            // Convert Int16 PCM to Float32 stereo using DataView (fast, no intermediate array)
+            const int16View = new Int16Array(bytes.buffer);
+            const numSamples = int16View.length / 2;
             const audioBuffer = audioContext.createBuffer(2, numSamples, 48000);
-            
-            // Deinterleave stereo channels
             const leftChannel = audioBuffer.getChannelData(0);
             const rightChannel = audioBuffer.getChannelData(1);
+            
             for (let i = 0; i < numSamples; i++) {
-                leftChannel[i] = float32Array[i * 2];
-                rightChannel[i] = float32Array[i * 2 + 1];
+                leftChannel[i] = int16View[i * 2] / 32768.0;
+                rightChannel[i] = int16View[i * 2 + 1] / 32768.0;
             }
             
             // Add to queue
             audioQueue.push(audioBuffer);
             totalBufferedSeconds += audioBuffer.duration;
             
+            // Logging: chunk arrival stats (only in debug mode)
+            if (AUDIO_DEBUG && chunkCount % 10 === 0) {
+                const scheduledAhead = nextPlayTime > 0 ? (nextPlayTime - audioContext.currentTime).toFixed(2) : '0';
+                console.log(`[AUDIO] chunk#${chunkCount} | inter-chunk: ${interChunkMs}ms | queue: ${audioQueue.length} | ahead: ${scheduledAhead}s`);
+            }
+            
             // Start playback after buffering enough
             if (!playbackStarted && totalBufferedSeconds >= BUFFER_SECONDS) {
                 playbackStarted = true;
                 nextPlayTime = audioContext.currentTime + 0.1;
-                scheduleBuffers();
                 addLog('🔊 Playback started!', 'change');
+                if (AUDIO_DEBUG) console.log(`[AUDIO] === PLAYBACK STARTED === queue=${audioQueue.length} buffered=${totalBufferedSeconds.toFixed(1)}s`);
+            }
+            
+            // Always ensure scheduler is running when we have audio
+            if (playbackStarted) {
+                startScheduler();
             }
         }
         
+        let schedulerInterval = null;
+        
         function scheduleBuffers() {
+            if (!audioContext || !playbackStarted) return;
+            
+            // Auto-resume if browser suspended the context
+            if (audioContext.state === 'suspended') {
+            if (AUDIO_DEBUG) console.warn('[AUDIO] ⚠️ AudioContext SUSPENDED — attempting resume');
+                audioContext.resume();
+                return;
+            }
+            
             // If we fell behind realtime, catch up to avoid gaps
             if (nextPlayTime < audioContext.currentTime) {
+                const gapSec = (audioContext.currentTime - nextPlayTime).toFixed(3);
+                gapCount++;
+            if (AUDIO_DEBUG) console.warn(`[AUDIO] ⚠️ GAP #${gapCount} detected! nextPlayTime was ${gapSec}s behind currentTime. Resetting. queue=${audioQueue.length}`);
                 nextPlayTime = audioContext.currentTime + 0.05;
             }
-            // Schedule up to 10s ahead for smooth playback
-            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + 10) {
+            // Schedule up to 3s ahead for low latency
+            const LOOKAHEAD = 3.0;
+            const CROSSFADE_MS = 10;
+            const crossfadeTime = CROSSFADE_MS / 1000;
+            let scheduledThisRun = 0;
+            while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + LOOKAHEAD) {
                 const buffer = audioQueue.shift();
                 const source = audioContext.createBufferSource();
                 source.buffer = buffer;
-                source.connect(audioContext.destination);
-                source.start(nextPlayTime);
-                nextPlayTime += buffer.duration;
+                
+                // Crossfade: fade-in at start, fade-out at end
+                const gain = audioContext.createGain();
+                const startTime = nextPlayTime;
+                const endTime = startTime + buffer.duration;
+                
+                gain.gain.setValueAtTime(0, startTime);
+                gain.gain.linearRampToValueAtTime(1, startTime + crossfadeTime);
+                gain.gain.setValueAtTime(1, endTime - crossfadeTime);
+                gain.gain.linearRampToValueAtTime(0, endTime);
+                
+                source.connect(gain);
+                gain.connect(audioContext.destination);
+                source.start(startTime);
+                source.onended = function() {
+                    gain.disconnect();
+                    source.disconnect();
+                };
+                nextPlayTime = endTime - crossfadeTime;
+                scheduledThisRun++;
             }
-            
-            if (isGenerating || audioQueue.length > 0) {
-                setTimeout(scheduleBuffers, 20);
+            if (AUDIO_DEBUG && scheduledThisRun > 0 && chunkCount % 10 === 0) {
+                const ahead = (nextPlayTime - audioContext.currentTime).toFixed(2);
+                console.log(`[SCHED] scheduled ${scheduledThisRun} | queue: ${audioQueue.length} | ahead: ${ahead}s | gaps: ${gapCount}`);
+            }
+            // Throttle backend: tell it to pause if queue is large, resume if small
+            if (ws && ws.readyState === 1) {
+                if (audioQueue.length > 10 && !backendThrottled) {
+                    backendThrottled = true;
+                    ws.send(JSON.stringify({ action: 'throttle', throttled: true }));
+                if (AUDIO_DEBUG) console.log('[THROTTLE] telling backend to PAUSE generation');
+                } else if (audioQueue.length < 5 && backendThrottled) {
+                    backendThrottled = false;
+                    ws.send(JSON.stringify({ action: 'throttle', throttled: false }));
+                if (AUDIO_DEBUG) console.log('[THROTTLE] telling backend to RESUME generation');
+                }
+            }
+            // Warn if queue is empty and we're still generating (only in debug mode)
+            if (AUDIO_DEBUG && audioQueue.length === 0 && isGenerating && chunkCount % 10 === 0) {
+                const ahead = (nextPlayTime - audioContext.currentTime).toFixed(2);
+                if (parseFloat(ahead) < 1.0) {
+                    console.warn(`[SCHED] ⚠️ QUEUE EMPTY! ahead=${ahead}s`);
+                }
             }
         }
+        
+        function startScheduler() {
+            if (schedulerInterval) return;
+            schedulerInterval = setInterval(() => {
+                if (!playbackStarted || !audioContext) {
+                    clearInterval(schedulerInterval);
+                    schedulerInterval = null;
+                    return;
+                }
+                scheduleBuffers();
+            }, 50);
+        }
+        
+        // Report stats to backend every 3s for monitoring
+        setInterval(() => {
+            if (playbackStarted && ws && ws.readyState === 1) {
+                const ahead = nextPlayTime > 0 && audioContext ? (nextPlayTime - audioContext.currentTime).toFixed(2) : '0';
+                ws.send(JSON.stringify({
+                    action: 'frontend_stats',
+                    stats: {
+                        chunkCount,
+                        gapCount,
+                        queueLen: audioQueue.length,
+                        bufferedSec: totalBufferedSeconds.toFixed(1),
+                        scheduledAhead: ahead,
+                        playbackStarted,
+                        ctxTime: audioContext ? audioContext.currentTime.toFixed(2) : '0',
+                        ctxState: audioContext ? audioContext.state : 'none',
+                    }
+                }));
+            }
+        }, 3000);
         
         function handleMP3Clip(data) {
             if (!audioContext) initAudio();
@@ -1523,9 +1683,17 @@ DASHBOARD_HTML = """
         }
         
         function stopAudio() {
+            if (AUDIO_DEBUG) console.log(`[AUDIO] === STOP === total chunks: ${chunkCount} | total gaps: ${gapCount} | queue remaining: ${audioQueue.length}`);
             audioQueue = [];
             playbackStarted = false;
             totalBufferedSeconds = 0;
+            chunkCount = 0;
+            gapCount = 0;
+            lastChunkTime = 0;
+            if (schedulerInterval) {
+                clearInterval(schedulerInterval);
+                schedulerInterval = null;
+            }
             if (audioContext) {
                 audioContext.close();
                 audioContext = null;
@@ -1555,6 +1723,7 @@ async def run_dashboard_server():
     eeg_state = {
         'inlet': None,
         'reconnecting': False,
+        'muse_proc': None,
     }
     try:
         from pylsl import StreamInlet, resolve_byprop
@@ -1573,19 +1742,34 @@ async def run_dashboard_server():
     
     async def broadcast(message):
         if connected_clients:
-            await asyncio.gather(*[client.send(json.dumps(message)) for client in connected_clients])
+            msg = json.dumps(message)
+            await asyncio.gather(*[_safe_send(client, msg) for client in connected_clients], return_exceptions=True)
+    
+    async def send_muse_status(connected):
+        await broadcast({'type': 'muse_status', 'connected': connected})
+    
+    _pending_sends = set()
+    
+    async def _safe_send(client, msg):
+        try:
+            await client.send(msg)
+        except Exception:
+            pass  # Client disconnected — silently ignore
     
     async def broadcast_fire(message):
         """Fire-and-forget broadcast for large messages like audio chunks"""
         if connected_clients:
-            fut = asyncio.ensure_future(asyncio.gather(
-                *[client.send(json.dumps(message)) for client in connected_clients]
-            ))
+            msg = json.dumps(message)
+            tasks = [asyncio.ensure_future(_safe_send(client, msg)) for client in connected_clients]
+            for t in tasks:
+                _pending_sends.add(t)
+                t.add_done_callback(_pending_sends.discard)
             await asyncio.sleep(0)
     
     async def reconnect_muse():
         """Busca MUSE periódicamente si no hay conexión activa"""
         from pylsl import StreamInlet, resolve_byprop
+        nonlocal eeg_buffer
         while True:
             if eeg_state['inlet'] is None and not eeg_state['reconnecting']:
                 eeg_state['reconnecting'] = True
@@ -1596,6 +1780,7 @@ async def run_dashboard_server():
                         eeg_state['inlet'] = StreamInlet(streams[0])
                         logger.info(f"✅ MUSE conectado: {streams[0].name()}")
                         await broadcast({'type': 'log', 'message': 'MUSE EEG conectado', 'level': 'change'})
+                        await send_muse_status(True)
                     else:
                         logger.info("⏳ MUSE no detectado, reintentando en 3s...")
                 except Exception as e:
@@ -1607,6 +1792,9 @@ async def run_dashboard_server():
     async def handler(websocket):
         connected_clients.add(websocket)
         logger.info(f"📱 Cliente conectado ({len(connected_clients)})")
+        
+        # Send current Muse status to new client
+        await websocket.send(json.dumps({'type': 'muse_status', 'connected': eeg_state['inlet'] is not None}))
         
         audio_task = None
         
@@ -1631,6 +1819,7 @@ async def run_dashboard_server():
                                     logger.warning("⚠️ MUSE stream perdido, esperando reconexión...")
                                     eeg_state['inlet'] = None
                                     empty_pulls = 0
+                                    await send_muse_status(False)
                                     await asyncio.sleep(1)
                         else:
                             # Datos simulados mientras se reconecta MUSE
@@ -1741,10 +1930,65 @@ async def run_dashboard_server():
                         processor.reset_baseline()
                         await broadcast({'type': 'log', 'message': 'Baseline reset', 'level': 'change'})
                     
+                    elif action == 'start_muse':
+                        import subprocess
+                        if eeg_state.get('muse_proc') is not None and eeg_state['muse_proc'].poll() is None:
+                            await broadcast({'type': 'log', 'message': 'Muse stream already running', 'level': 'error'})
+                            continue
+                        try:
+                            proc = subprocess.Popen(
+                                ['muselsl', 'stream'],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            eeg_state['muse_proc'] = proc
+                            logger.info(f"📡 muselsl stream started (PID {proc.pid})")
+                            await broadcast({'type': 'log', 'message': '📡 muselsl stream started, waiting for LSL...', 'level': 'change'})
+                            
+                            # Wait for LSL stream to appear (up to 10s)
+                            from pylsl import resolve_byprop as _resolve
+                            lsl_found = False
+                            for attempt in range(5):
+                                await asyncio.sleep(2)
+                                if proc.poll() is not None:
+                                    await broadcast({'type': 'log', 'message': '⚠️ muselsl stream exited — is Muse paired via Bluetooth?', 'level': 'error'})
+                                    await send_muse_status(False)
+                                    break
+                                streams = _resolve('type', 'EEG', timeout=1)
+                                if streams:
+                                    eeg_state['inlet'] = StreamInlet(streams[0])
+                                    lsl_found = True
+                                    logger.info(f"✅ MUSE LSL stream detected after muselsl start")
+                                    await broadcast({'type': 'log', 'message': '✅ Muse connected via LSL', 'level': 'change'})
+                                    await send_muse_status(True)
+                                    break
+                            
+                            if not lsl_found and proc.poll() is None:
+                                await broadcast({'type': 'log', 'message': '⏳ muselsl running but no LSL stream yet. Check Bluetooth pairing.', 'level': 'error'})
+                                await send_muse_status(False)
+                        except FileNotFoundError:
+                            await broadcast({'type': 'log', 'message': '❌ muselsl not found. Install with: pip install muselsl', 'level': 'error'})
+                        except Exception as e:
+                            await broadcast({'type': 'log', 'message': f'❌ Error starting muse: {e}', 'level': 'error'})
+                    
                     elif action == 'update_settings':
                         settings = cmd.get('settings', {})
                         processor.update_settings(settings)
                         logger.info(f"🎚️ Settings updated: smoothing={processor.smoothing}, sensitivity={processor.sensitivity:.1f}")
+                    
+                    elif action == 'frontend_stats':
+                        s = cmd.get('stats', {})
+                        logger.info(f"📊 [FRONTEND] chunks={s.get('chunkCount',0)} gaps={s.get('gapCount',0)} queue={s.get('queueLen',0)} buffered={s.get('bufferedSec','0')}s ahead={s.get('scheduledAhead','0')}s ctxTime={s.get('ctxTime','0')}s ctxState={s.get('ctxState','?')}")
+                    
+                    elif action == 'throttle':
+                        throttled = cmd.get('throttled', False)
+                        mg = state['music_gen']
+                        if mg and hasattr(mg, '_throttled'):
+                            mg._throttled = throttled
+                            if throttled:
+                                logger.info("⏸️ Backend throttled — pausing generation (frontend buffer full)")
+                            else:
+                                logger.info("▶️ Backend unthrottled — resuming generation")
                         
                 except Exception as e:
                     logger.error(f"Error comando: {e}")
