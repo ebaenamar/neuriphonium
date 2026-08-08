@@ -307,9 +307,35 @@
                     </div>
                 </div>
                 
+                <div id="model-selector-div" style="margin-bottom:15px;">
+                    <label style="font-size:0.85em; opacity:0.7; display:block; margin-bottom:6px;">Model Size (Local)</label>
+                    <select id="model-select" style="width:100%; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#e6edf3; font-size:0.85em;">
+                        <option value="mrt2_small">⚡ Fast — mrt2_small (230M, ~2.3x realtime)</option>
+                        <option value="mrt2_base_fast">🚀 Base Fast — 4-bit + 1 CFG (~2x realtime, best quality/speed)</option>
+                        <option value="mrt2_base">🎨 Quality — mrt2_base (2.4B, ~0.7x realtime, cuts)</option>
+                    </select>
+                </div>
+                
                 <div class="music-controls">
                     <button class="btn-start" id="btn-start" onclick="startMusic()" disabled>▶️ Start Music</button>
                     <button class="btn-stop" id="btn-stop" onclick="stopMusic()" disabled>⏹️ Stop</button>
+                </div>
+                
+                <button class="btn-reset" id="btn-calibrate" onclick="startCalibration()" style="width:100%; margin-bottom:10px;">📊 Calibrate Baseline (10s)</button>
+                
+                <div style="margin-bottom:10px;">
+                    <label style="font-size:0.8em; opacity:0.7; display:block; margin-bottom:4px;">Genre Override</label>
+                    <select id="genre-select" onchange="setGenre(this.value)" style="width:100%; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#e6edf3; font-size:0.85em;">
+                        <option value="">Auto (EEG-driven)</option>
+                        <option value="cool jazz, laid back, mellow trumpet, instrumental">Cool Jazz</option>
+                        <option value="experimental piano, prepared piano, extended techniques, classical">Experimental Piano</option>
+                        <option value="contemporary classical, strings and piano, orchestral">Classical</option>
+                        <option value="futuristic electronic, driving synth arpeggios, energetic">Futuristic Electronic</option>
+                        <option value="ambient, atmospheric pads, evolving textures">Ambient</option>
+                        <option value="bebop jazz, fast tempo, virtuosic saxophone, instrumental">Bebop</option>
+                        <option value="modal jazz, spacious, introspective piano, instrumental">Modal Jazz</option>
+                        <option value="lofi hip hop, dusty piano, vinyl crackle, chill">Lo-fi Hip Hop</option>
+                    </select>
                 </div>
                 
                 <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:10px;">🔄 Reset Baseline</button>
@@ -475,7 +501,13 @@
                 setTimeout(connect, 2000);
             };
             
+            ws.binaryType = 'arraybuffer';
             ws.onmessage = (event) => {
+                // Binary frames = raw audio chunks (4-byte chunk_id + int16 samples)
+                if (event.data instanceof ArrayBuffer) {
+                    handleBinaryAudio(event.data);
+                    return;
+                }
                 const data = JSON.parse(event.data);
                 
                 if (data.type === 'eeg') {
@@ -497,6 +529,11 @@
                     addLog('🎵 Music started - buffering audio...', 'change');
                 } else if (data.type === 'muse_status') {
                     updateMuseStatus(data.connected);
+                } else if (data.type === 'calibration_done') {
+                    const btn = document.getElementById('btn-calibrate');
+                    btn.disabled = false;
+                    btn.textContent = data.success ? '📊 Recalibrate Baseline' : '📊 Calibrate Baseline (10s)';
+                    if (data.success) addLog('✅ Baseline captured!', 'change');
                 } else if (data.type === 'music_stopped') {
                     isGenerating = false;
                     stopAudio();
@@ -617,12 +654,14 @@
             selectedEngine = engine;
             document.getElementById('engine-local').style.background = engine === 'local' ? 'rgba(78,205,196,0.2)' : 'rgba(255,255,255,0.05)';
             document.getElementById('engine-online').style.background = engine === 'online' ? 'rgba(78,205,196,0.2)' : 'rgba(255,255,255,0.05)';
+            document.getElementById('model-selector-div').style.display = engine === 'local' ? 'block' : 'none';
             addLog('Engine: ' + (engine === 'local' ? 'Local (Magenta)' : 'Online (Lyria)'));
         }
         
         function startMusic() {
-            ws.send(JSON.stringify({ action: 'start_music', engine: selectedEngine }));
-            addLog('Starting music generation...');
+            const modelSize = document.getElementById('model-select') ? document.getElementById('model-select').value : 'mrt2_small';
+            ws.send(JSON.stringify({ action: 'start_music', engine: selectedEngine, model_size: modelSize }));
+            addLog(`Starting music generation... (${selectedEngine}${selectedEngine === 'local' ? ', ' + modelSize : ''})`);
         }
         
         function stopMusic() {
@@ -633,6 +672,23 @@
         function resetBaseline() {
             ws.send(JSON.stringify({ action: 'reset_baseline' }));
             addLog('🔄 Resetting baseline...', 'change');
+        }
+        
+        function startCalibration() {
+            const btn = document.getElementById('btn-calibrate');
+            btn.disabled = true;
+            btn.textContent = '📊 Calibrating...';
+            ws.send(JSON.stringify({ action: 'calibrate' }));
+            addLog('📊 Calibrating baseline — stay still and relaxed for 10s...', 'change');
+        }
+        
+        function setGenre(value) {
+            ws.send(JSON.stringify({ action: 'set_genre', genre: value }));
+            if (value) {
+                addLog(`🎵 Genre override: ${value}`, 'change');
+            } else {
+                addLog('🎵 Genre: Auto (EEG-driven)', 'change');
+            }
         }
         
         let museStreamRunning = false;
@@ -741,7 +797,7 @@
         let audioQueue = [];
         let isPlaying = false;
         let nextPlayTime = 0;
-        const BUFFER_SECONDS = 6; // Buffer before starting playback
+        const BUFFER_SECONDS = 30; // Pre-buffer before playback (30s = enough headroom for jitter)
         let totalBufferedSeconds = 0;
         let playbackStarted = false;
         let chunkCount = 0;
@@ -762,7 +818,7 @@
             }
         }
         
-        function handleAudioChunk(data) {
+        function handleBinaryAudio(arrayBuffer) {
             if (!audioContext) initAudio();
             
             const now = performance.now();
@@ -770,19 +826,8 @@
             const interChunkMs = lastChunkTime > 0 ? (now - lastChunkTime).toFixed(0) : '-';
             lastChunkTime = now;
             
-            // Fast base64 decode: use atob + Uint8Array from char codes in chunks
-            const binaryString = atob(data.data);
-            const len = binaryString.length;
-            const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i += 8192) {
-                const end = Math.min(i + 8192, len);
-                for (let j = i; j < end; j++) {
-                    bytes[j] = binaryString.charCodeAt(j);
-                }
-            }
-            
-            // Convert Int16 PCM to Float32 stereo using DataView (fast, no intermediate array)
-            const int16View = new Int16Array(bytes.buffer);
+            // Skip 4-byte header (chunk_id), rest is Int16 stereo PCM
+            const int16View = new Int16Array(arrayBuffer, 4);
             const numSamples = int16View.length / 2;
             const audioBuffer = audioContext.createBuffer(2, numSamples, 48000);
             const leftChannel = audioBuffer.getChannelData(0);
@@ -807,8 +852,15 @@
             if (!playbackStarted && totalBufferedSeconds >= BUFFER_SECONDS) {
                 playbackStarted = true;
                 nextPlayTime = audioContext.currentTime + 0.1;
-                addLog('🔊 Playback started!', 'change');
+                addLog(`🔊 Playback started! (buffer: ${totalBufferedSeconds.toFixed(1)}s)`, 'change');
                 if (AUDIO_DEBUG) console.log(`[AUDIO] === PLAYBACK STARTED === queue=${audioQueue.length} buffered=${totalBufferedSeconds.toFixed(1)}s`);
+            } else if (!playbackStarted) {
+                // Show buffering progress
+                const pct = Math.min(100, (totalBufferedSeconds / BUFFER_SECONDS * 100).toFixed(0));
+                const bufStatus = document.getElementById('buffer-status');
+                if (bufStatus) bufStatus.textContent = `${pct}% (buffering ${totalBufferedSeconds.toFixed(1)}s/${BUFFER_SECONDS}s)`;
+                const bufBar = document.getElementById('buffer-bar');
+                if (bufBar) bufBar.style.width = pct + '%';
             }
             
             // Always ensure scheduler is running when we have audio
@@ -834,36 +886,23 @@
                 const gapSec = (audioContext.currentTime - nextPlayTime).toFixed(3);
                 gapCount++;
             if (AUDIO_DEBUG) console.warn(`[AUDIO] ⚠️ GAP #${gapCount} detected! nextPlayTime was ${gapSec}s behind currentTime. Resetting. queue=${audioQueue.length}`);
-                nextPlayTime = audioContext.currentTime + 0.05;
+                nextPlayTime = audioContext.currentTime + 0.02;
             }
-            // Schedule up to 3s ahead for low latency
+            // Schedule only 3s ahead — keep rest in queue as jitter buffer
             const LOOKAHEAD = 3.0;
-            const CROSSFADE_MS = 10;
-            const crossfadeTime = CROSSFADE_MS / 1000;
             let scheduledThisRun = 0;
             while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + LOOKAHEAD) {
                 const buffer = audioQueue.shift();
                 const source = audioContext.createBufferSource();
                 source.buffer = buffer;
                 
-                // Crossfade: fade-in at start, fade-out at end
-                const gain = audioContext.createGain();
-                const startTime = nextPlayTime;
-                const endTime = startTime + buffer.duration;
-                
-                gain.gain.setValueAtTime(0, startTime);
-                gain.gain.linearRampToValueAtTime(1, startTime + crossfadeTime);
-                gain.gain.setValueAtTime(1, endTime - crossfadeTime);
-                gain.gain.linearRampToValueAtTime(0, endTime);
-                
-                source.connect(gain);
-                gain.connect(audioContext.destination);
-                source.start(startTime);
+                // No crossfade — model streaming state ensures seamless continuity
+                source.connect(audioContext.destination);
+                source.start(nextPlayTime);
                 source.onended = function() {
-                    gain.disconnect();
                     source.disconnect();
                 };
-                nextPlayTime = endTime - crossfadeTime;
+                nextPlayTime = nextPlayTime + buffer.duration;
                 scheduledThisRun++;
             }
             if (AUDIO_DEBUG && scheduledThisRun > 0 && chunkCount % 10 === 0) {
@@ -872,11 +911,11 @@
             }
             // Throttle backend: tell it to pause if queue is large, resume if small
             if (ws && ws.readyState === 1) {
-                if (audioQueue.length > 10 && !backendThrottled) {
+                if (audioQueue.length > 40 && !backendThrottled) {
                     backendThrottled = true;
                     ws.send(JSON.stringify({ action: 'throttle', throttled: true }));
                 if (AUDIO_DEBUG) console.log('[THROTTLE] telling backend to PAUSE generation');
-                } else if (audioQueue.length < 5 && backendThrottled) {
+                } else if (audioQueue.length < 15 && backendThrottled) {
                     backendThrottled = false;
                     ws.send(JSON.stringify({ action: 'throttle', throttled: false }));
                 if (AUDIO_DEBUG) console.log('[THROTTLE] telling backend to RESUME generation');
@@ -900,7 +939,7 @@
                     return;
                 }
                 scheduleBuffers();
-            }, 50);
+            }, 25);
         }
         
         // Report stats to backend every 3s for monitoring

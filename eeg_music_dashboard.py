@@ -57,6 +57,25 @@ class EEGProcessor:
             'beta': 1.0,
             'gamma': 1.0
         }
+        
+        # Tonality state — stable, only changes on sustained mental state shifts
+        self._current_key = 'C_MAJOR_A_MINOR'
+        self._key_candidate = None
+        self._key_candidate_since = 0
+        self._key_hysteresis_seconds = 8
+        
+        # Genre state — stable, only changes on sustained mood shifts
+        self._current_genre = 'cool jazz, laid back, mellow trumpet, instrumental'
+        self._genre_candidate = None
+        self._genre_candidate_since = 0
+        self._genre_hysteresis_seconds = 12
+        self._manual_genre = None  # When set, overrides EEG-driven genre
+        
+        # Per-band baseline — captured during calibration
+        self._band_baseline = None  # {band: (mean, std)}
+        self._calibrating = False
+        self._calibration_samples = []
+        self._calibration_start = 0
     
     def update_settings(self, settings: dict):
         """Actualizar configuración desde la UI"""
@@ -69,6 +88,64 @@ class EEGProcessor:
                 self.band_history = {band: deque(maxlen=self.smoothing) for band in EEG_BANDS}
         if 'global_sensitivity' in settings:
             self.sensitivity = settings['global_sensitivity']
+    
+    def start_calibration(self):
+        """Start 10-second baseline capture"""
+        self._calibrating = True
+        self._calibration_samples = []
+        self._calibration_start = time.time()
+        logger.info("📊 Starting EEG calibration (10s)...")
+    
+    def feed_calibration(self, bands: dict):
+        """Feed band powers during calibration"""
+        if self._calibrating:
+            self._calibration_samples.append(bands.copy())
+    
+    def finish_calibration(self) -> bool:
+        """Compute per-band baseline from calibration samples. Returns True if enough data."""
+        if len(self._calibration_samples) < 5:
+            logger.warning(f"⚠️ Not enough calibration samples ({len(self._calibration_samples)})")
+            self._calibrating = False
+            return False
+        
+        self._band_baseline = {}
+        for band in ['delta', 'theta', 'alpha', 'beta', 'gamma']:
+            values = [s[band] for s in self._calibration_samples if band in s]
+            if values:
+                mean = np.mean(values)
+                std = np.std(values) if len(values) > 1 else 0.01
+                self._band_baseline[band] = (mean, max(std, 0.001))
+        
+        self._calibrating = False
+        logger.info(f"✅ Baseline captured: {self._band_baseline}")
+        return True
+    
+    @property
+    def is_calibrated(self) -> bool:
+        return self._band_baseline is not None
+    
+    @property
+    def calibration_progress(self) -> float:
+        if not self._calibrating:
+            return 0
+        return min(1.0, (time.time() - self._calibration_start) / 10.0)
+    
+    def get_deviations(self, bands: dict) -> dict:
+        """Get z-score deviations from personal baseline for each band.
+        Positive = above baseline, negative = below baseline.
+        Returns dict of {band: z_score} clamped to [-3, 3]."""
+        if not self._band_baseline:
+            return {band: 0.0 for band in ['delta', 'theta', 'alpha', 'beta', 'gamma']}
+        
+        deviations = {}
+        for band in ['delta', 'theta', 'alpha', 'beta', 'gamma']:
+            if band in self._band_baseline:
+                mean, std = self._band_baseline[band]
+                z = (bands.get(band, mean) - mean) / std
+                deviations[band] = np.clip(z, -3, 3)
+            else:
+                deviations[band] = 0.0
+        return deviations
     
     def extract_bands(self, eeg_data: np.ndarray) -> dict:
         if eeg_data.ndim == 1:
@@ -100,31 +177,32 @@ class EEGProcessor:
     def calculate_metrics(self, bands: dict) -> dict:
         d, t, a, b, g = [bands.get(x, 0.2) for x in ['delta', 'theta', 'alpha', 'beta', 'gamma']]
         
-        arousal = np.clip(0.1*d + 0.2*t + 0.3*a + 0.5*b + 0.7*g, 0, 1)
-        valence = np.clip((a - 0.3*t - 0.2*abs(b-t) + 0.5), 0, 1)
-        focus = np.clip(b / (t + 0.01) / 3, 0, 1)
-        relaxation = np.clip(a / (b + 0.01) / 2, 0, 1)
+        # Get z-score deviations from personal baseline
+        dev = self.get_deviations(bands)
         
-        metrics = {'arousal': arousal, 'valence': valence, 'focus': focus, 'relaxation': relaxation, **bands}
+        # Convert z-scores to 0-1 range (0 = baseline, 0.5 = 1 std above, 1 = 3 std above)
+        def z_to_01(z):
+            return np.clip((z + 3) / 6, 0, 1)
         
-        # Baseline
-        if self.baseline_metrics is None:
-            self.baseline_samples.append(metrics.copy())
-            if len(self.baseline_samples) >= 5:
-                self.baseline_metrics = {
-                    k: np.mean([s[k] for s in self.baseline_samples])
-                    for k in ['arousal', 'valence', 'focus', 'relaxation']
-                }
+        # Use deviations for metrics when calibrated, raw values otherwise
+        if self.is_calibrated:
+            d_m, t_m, a_m, b_m, g_m = z_to_01(dev['delta']), z_to_01(dev['theta']), z_to_01(dev['alpha']), z_to_01(dev['beta']), z_to_01(dev['gamma'])
+        else:
+            d_m, t_m, a_m, b_m, g_m = d, t, a, b, g
         
-        # Cambios relativos
-        if self.baseline_metrics:
-            for key in ['arousal', 'valence', 'focus', 'relaxation']:
-                delta = metrics[key] - self.baseline_metrics[key]
-                metrics[f'{key}_adjusted'] = np.clip(
-                    self.baseline_metrics[key] + delta * self.sensitivity, 0, 1
-                )
+        arousal = np.clip(0.1*d_m + 0.2*t_m + 0.3*a_m + 0.5*b_m + 0.7*g_m, 0, 1)
+        valence = np.clip((a_m - 0.3*t_m - 0.2*abs(b_m-t_m) + 0.5), 0, 1)
+        focus = np.clip(b_m / (t_m + 0.01) / 3, 0, 1)
+        relaxation = np.clip(a_m / (b_m + 0.01) / 2, 0, 1)
         
-        # Detectar cambios
+        metrics = {
+            'arousal': arousal, 'valence': valence, 'focus': focus, 'relaxation': relaxation,
+            'calibrated': self.is_calibrated,
+            'deviations': dev,
+            **bands
+        }
+        
+        # Detectar cambios significativos (relative to previous, not baseline)
         metrics['significant_change'] = False
         if self.prev_metrics:
             for key in ['arousal', 'valence']:
@@ -136,6 +214,16 @@ class EEGProcessor:
         return metrics
     
     def map_to_lyria(self, bands: dict, metrics: dict) -> dict:
+        """
+        Neuroscience-grounded continuous mapping.
+        
+        Each band controls multiple musical dimensions simultaneously:
+        - Delta (0.5-4Hz): Deep/unconscious → register, sustain, drone depth
+        - Theta (4-8Hz): Creativity/DMN → harmonic complexity, rubato, space
+        - Alpha (8-13Hz): Flow/relaxed → groove, legato, consonance
+        - Beta (13-30Hz): Focus/motor → rhythmic precision, density, tempo
+        - Gamma (30-100Hz): Binding/insight → brightness, ornamentation, tension
+        """
         arousal = metrics.get('arousal_adjusted', metrics['arousal'])
         valence = metrics.get('valence_adjusted', metrics['valence'])
         focus = metrics.get('focus_adjusted', metrics['focus'])
@@ -143,33 +231,187 @@ class EEGProcessor:
         
         delta = bands.get('delta', 0.2)
         theta = bands.get('theta', 0.2)
+        alpha = bands.get('alpha', 0.2)
+        beta = bands.get('beta', 0.2)
         gamma = bands.get('gamma', 0.2)
         
-        bpm = int(60 + arousal * 140)
-        density = np.clip(0.2 + arousal * 0.6 - relaxation * 0.3, 0, 1)
-        brightness = np.clip(gamma * 2.0 + valence * 0.4, 0, 1)
-        guidance = 1.5 + focus * 4.0
-        temperature = 0.6 + theta * 2.0
+        # === CONTINUOUS PARAMETERS ===
         
-        # Scale
-        if valence > 0.6:
-            scale = 'D_MAJOR_B_MINOR' if arousal > 0.6 else ('G_MAJOR_E_MINOR' if arousal > 0.4 else 'C_MAJOR_A_MINOR')
-        elif valence > 0.4:
-            scale = 'A_MAJOR_G_FLAT_MINOR' if arousal > 0.5 else 'F_MAJOR_D_MINOR'
+        # BPM: driven by arousal + beta (motor cortex activation)
+        # Low arousal + high delta = slow (60-80 BPM)
+        # High arousal + high beta = fast (120-160 BPM)
+        beta_drive = beta / (alpha + 0.01)  # Beta vs alpha = tension vs release
+        bpm = int(np.clip(60 + arousal * 80 + beta_drive * 20 - delta * 30, 50, 170))
+        
+        # Density: how many notes per bar
+        # High beta = dense, high delta = sparse
+        density = np.clip(0.15 + beta * 0.6 + arousal * 0.3 - delta * 0.5, 0.05, 1.0)
+        
+        # Brightness: spectral content
+        # Gamma adds harmonics, valence shifts bright/dark
+        brightness = np.clip(0.2 + gamma * 0.8 + valence * 0.3 - delta * 0.2, 0, 1)
+        
+        # Groove/Swing: alpha-driven (flow state = natural groove)
+        # High alpha = more swing/shuffle, low alpha = straight/grid
+        groove = np.clip(alpha * 1.5 - beta * 0.3, 0, 1)
+        
+        # Harmonic complexity: theta-driven (default mode = wandering)
+        # High theta = extended chords, modal interchange, surprising turns
+        harmonic_complexity = np.clip(0.1 + theta * 1.2 + (1 - focus) * 0.3, 0, 1)
+        
+        # Legato/Staccato: alpha vs beta
+        # Alpha = smooth connected, beta = sharp detached
+        legato = np.clip(alpha / (beta + 0.01) / 3, 0, 1)
+        
+        # Reverb/Space: relaxation + theta (spaciousness)
+        space = np.clip(relaxation * 0.6 + theta * 0.5, 0, 1)
+        
+        # Register/Tessitura: delta pulls low, gamma pulls high
+        register = np.clip(0.5 - delta * 0.8 + gamma * 0.5, 0, 1)  # 0=low, 1=high
+        
+        # Dynamics/Expression: arousal drives loudness variation
+        dynamics = np.clip(0.2 + arousal * 0.8, 0, 1)
+        
+        # Guidance (CFG): focus + arousal push style adherence
+        guidance = 2.5 + focus * 2.5 + arousal * 1.5
+        
+        # Temperature: theta/alpha contrast drives creativity
+        temperature = np.clip(0.4 + theta * 1.5 + arousal * 0.5 - delta * 0.3, 0.3, 2.0)
+        
+        # === TONALITY (stable, hysteresis) ===
+        scale = self._resolve_key(valence, arousal, focus, delta, theta, gamma, beta)
+        
+        # === GENRE (stable, hysteresis) ===
+        if self._manual_genre:
+            genre = self._manual_genre
         else:
-            scale = 'E_FLAT_MAJOR_C_MINOR' if arousal > 0.6 else ('B_FLAT_MAJOR_G_MINOR' if arousal > 0.4 else 'A_FLAT_MAJOR_F_MINOR')
+            genre = self._resolve_genre(valence, arousal, theta, alpha, gamma, beta)
         
         return {
-            'bpm': max(60, min(200, bpm)),
-            'density': max(0, min(1, density)),
-            'brightness': max(0, min(1, brightness)),
-            'guidance': max(0, min(6, guidance)),
-            'temperature': max(0, min(3, temperature)),
+            'bpm': bpm,
+            'density': density,
+            'brightness': brightness,
+            'groove': groove,
+            'harmonic_complexity': harmonic_complexity,
+            'legato': legato,
+            'space': space,
+            'register': register,
+            'dynamics': dynamics,
+            'guidance': guidance,
+            'temperature': temperature,
             'scale': scale,
-            'mute_drums': relaxation > 0.65,
-            'mute_bass': delta > 0.35,
+            'genre': genre,
+            'mute_drums': False,
+            'mute_bass': False,
             **metrics
         }
+    
+    def _resolve_key(self, valence, arousal, focus, delta, theta, gamma, beta) -> str:
+        """
+        Map mental state to musical key. Stable with hysteresis.
+        
+        Mental state → Key:
+        - Calm + positive (alpha dominant, high valence) → C Major (pure, open)
+        - Calm + neutral (balanced, moderate valence) → G Major (warm, pastoral)
+        - Calm + dark (delta dominant, low valence) → A Minor (introspective)
+        - Creative + positive (theta dominant, high valence) → D Major (bright, expansive)
+        - Creative + neutral (theta dominant, moderate valence) → E Minor (mysterious, flowing)
+        - Creative + dark (theta + delta, low valence) → B Minor (deep, searching)
+        - Focused + positive (beta dominant, high valence) → F Major (confident, warm)
+        - Focused + neutral (beta dominant) → D Minor (driven, determined)
+        - Focused + dark (beta + low valence) → E-flat Major (tense, dramatic)
+        - Peak/insight (gamma dominant) → current key stays (don't disrupt flow)
+        """
+        # Determine target key from mental state
+        if gamma > 0.35:
+            target = self._current_key  # Peak states don't change key
+        elif valence > 0.6 and arousal < 0.5:
+            target = 'C_MAJOR_A_MINOR'      # Calm + positive
+        elif valence > 0.6 and arousal >= 0.5:
+            target = 'D_MAJOR_B_MINOR'       # Energetic + positive
+        elif valence < 0.4 and delta > 0.3:
+            target = 'A_FLAT_MAJOR_F_MINOR'  # Deep + dark
+        elif valence < 0.4 and theta > 0.3:
+            target = 'E_FLAT_MAJOR_C_MINOR'  # Creative + dark
+        elif valence < 0.4:
+            target = 'B_FLAT_MAJOR_G_MINOR'  # Dark + tense
+        elif theta > 0.3 and valence > 0.5:
+            target = 'G_MAJOR_E_MINOR'       # Creative + positive
+        elif beta > 0.3 and focus > 0.5:
+            target = 'F_MAJOR_D_MINOR'       # Focused + driven
+        else:
+            target = 'C_MAJOR_A_MINOR'       # Default: neutral
+        
+        # Hysteresis: only change if target persists for N seconds
+        now = time.time()
+        if target != self._current_key:
+            if target != self._key_candidate:
+                self._key_candidate = target
+                self._key_candidate_since = now
+            elif now - self._key_candidate_since >= self._key_hysteresis_seconds:
+                self._current_key = target
+                self._key_candidate = None
+        else:
+            self._key_candidate = None
+        
+        return self._current_key
+    
+    def _resolve_genre(self, valence, arousal, theta=0.2, alpha=0.2, gamma=0.2, beta=0.2) -> str:
+        """
+        Map sustained mental state to genre. Oscillates between jazz and futuristic electronic.
+        
+        Theta (creativity/DMN) → futuristic electronic
+        Alpha (flow/relaxed) → jazz
+        Gamma (insight) → experimental electronic
+        Beta (focus) → bebop jazz
+        
+        Valence × Arousal sets the energy within the genre.
+        """
+        # Theta/alpha ratio determines jazz vs electronic axis
+        theta_alpha = theta / (alpha + 0.01)  # >1 = more creative/dreamy, <1 = more flow/relaxed
+        gamma_beta = gamma / (beta + 0.01)   # >1 = more insight/sparkle, <1 = more focused/precise
+        
+        # Pick genre family: jazz vs electronic
+        if theta_alpha > 1.5 or gamma > 0.3:
+            # Futuristic electronic territory
+            if arousal > 0.6:
+                target = "futuristic electronic, driving synth arpeggios, energetic"
+            elif valence < 0.4:
+                target = "dark ambient electronic, deep drones, atmospheric"
+            else:
+                target = "chillwave, dreamy synth pads, electronic textures"
+        elif gamma_beta > 1.5:
+            # Experimental/IDM territory
+            target = "experimental electronic, glitchy, intricate rhythms"
+        elif theta_alpha < 0.6 and beta > 0.2:
+            # Bebop/precise jazz territory
+            target = "bebop jazz, fast tempo, virtuosic saxophone, instrumental"
+        elif arousal > 0.6:
+            # High energy jazz
+            target = "upbeat jazz swing, energetic brass, walking bass"
+        elif valence < 0.4:
+            # Dark jazz
+            target = "modal jazz, spacious, introspective piano, instrumental"
+        elif valence > 0.6:
+            # Warm jazz
+            target = "smooth jazz, saxophone and piano, instrumental"
+        else:
+            # Default: cool jazz
+            target = "cool jazz, laid back, mellow trumpet, instrumental"
+        
+        # Hysteresis: only change if target persists
+        now = time.time()
+        if target != self._current_genre:
+            if target != self._genre_candidate:
+                self._genre_candidate = target
+                self._genre_candidate_since = now
+            elif now - self._genre_candidate_since >= self._genre_hysteresis_seconds:
+                self._current_genre = target
+                self._genre_candidate = None
+        else:
+            self._genre_candidate = None
+        
+        return self._current_genre
     
     def generate_prompts(self, params: dict) -> list:
         prompts = []
@@ -251,7 +493,7 @@ class EEGProcessor:
 class MusicGenerator:
     """Generador de música local con Magenta RealTime 2"""
     
-    def __init__(self):
+    def __init__(self, model_size='mrt2_small'):
         self.is_generating = False
         self.audio_chunks = []
         self.current_style_embedding = None
@@ -266,14 +508,19 @@ class MusicGenerator:
         self._target_style_embedding = None
         self._style_blend = 0.4  # Faster style movement (was 0.15, too slow)
         self._vibe_history = deque(maxlen=10)
-        self._tflite_lock = threading.Lock()  # TFLite interpreters aren't thread-safe
+        self._tflite_lock = threading.Lock()  # Only for MusicCoCa TFLite interpreters
+        self._gen_lock = threading.Lock()  # Separate lock for MLX generation (not needed but kept for safety)
         self._throttled = False  # Backend throttle flag set by frontend
+        self._last_vibe_prompt = None  # Cache to skip re-embedding when prompt unchanged
+        self._send_queue = None  # Will be set to a thread-safe queue for audio sends
+        self.audio_bin_callback = None  # Binary audio send callback
         
-        logger.info("🧠 Cargando modelo local Magenta RealTime 2 (mrt2_small)...")
+        logger.info(f"🧠 Cargando modelo local Magenta RealTime 2 ({model_size})...")
         from magenta_rt.mlx.system import MagentaRT2SystemMlxfn
-        self.mrt = MagentaRT2SystemMlxfn(size='mrt2_small')
+        self.mrt = MagentaRT2SystemMlxfn(size=model_size)
+        self.model_size = model_size
+        logger.info(f"✅ Modelo {model_size} cargado.")
         self.state = None
-        logger.info("✅ Modelo local Magenta RealTime 2 listo.")
         
     async def start(self):
         """Iniciar generación de música local"""
@@ -286,6 +533,8 @@ class MusicGenerator:
         self.buffer_ready = False
         self.buffer_progress = 0
         self.state = None  # Reset state para una nueva sesión
+        self._silent_streak = 0  # Track consecutive silent chunks
+        self._total_bytes = 0  # Running byte counter for buffer progress
         
         # Codificar estilo inicial por defecto
         self.current_style_embedding = self.mrt.embed_style("gentle flowing atmospheric music, ambient, calm")
@@ -324,95 +573,47 @@ class MusicGenerator:
         return filepath
         
     def _build_vibe_prompt(self, params: dict) -> str:
-        """Build a continuous vibe prompt from EEG bands — no discrete thresholds.
-        Each band contributes proportionally to the musical texture."""
+        """Build prompt from stable genre + continuous band modulation.
+        Genre = stable identity (hysteresis). Bands = continuous variation within that genre."""
+        
+        genre = params.get('genre', 'lofi jazz piano, warm, gentle')
+        
+        # Continuous modifiers from bands — these add variety WITHIN the genre
         delta = params.get('delta', 0.2)
         theta = params.get('theta', 0.2)
         alpha = params.get('alpha', 0.2)
         beta = params.get('beta', 0.2)
         gamma = params.get('gamma', 0.2)
-        arousal = params.get('arousal_adjusted', params.get('arousal', 0.5))
-        valence = params.get('valence_adjusted', params.get('valence', 0.5))
-        relaxation = params.get('relaxation_adjusted', params.get('relaxation', 0.5))
-        focus = params.get('focus_adjusted', params.get('focus', 0.5))
         
-        # --- Energy layer (continuous) ---
-        energy_words = []
-        if arousal > 0.05:
-            energy_words.append("sustained tones")
-        if arousal > 0.25:
-            energy_words.append("gentle pulse")
-        if arousal > 0.45:
-            energy_words.append("flowing rhythm")
-        if arousal > 0.65:
-            energy_words.append("driving groove")
-        if arousal > 0.8:
-            energy_words.append("intense energy")
-        energy_str = ", ".join(energy_words[-2:]) if energy_words else "calm"
+        # Pick the 1-2 most extreme band characteristics as modifiers
+        modifiers = []
         
-        # --- Mood layer (valence: dark <-> bright, continuous blend) ---
-        if valence < 0.5:
-            mood_str = "contemplative, introspective"
-            if valence < 0.3:
-                mood_str += ", melancholic"
-        else:
-            mood_str = "warm, open"
-            if valence > 0.7:
-                mood_str += ", uplifting"
+        # Delta: depth
+        if delta > 0.25:
+            modifiers.append("deep bass")
         
-        # --- Texture layer (from individual bands, weighted blend) ---
-        texture_parts = []
+        # Theta: dreaminess
+        if theta > 0.25:
+            modifiers.append("dreamy")
         
-        # Delta: depth, gravity, bass presence
-        if delta > 0.15:
-            weight = min(delta * 3, 1.0)
-            texture_parts.append(f"deep bass drones ({weight:.0%})")
+        # Alpha: smoothness
+        if alpha > 0.25:
+            modifiers.append("smooth")
         
-        # Theta: dreamy, surreal, creative
-        if theta > 0.15:
-            weight = min(theta * 3, 1.0)
-            texture_parts.append(f"dreamy drifting atmosphere ({weight:.0%})")
+        # Beta: energy
+        if beta > 0.25:
+            modifiers.append("rhythmic")
         
-        # Alpha: smooth, flowing, melodic
-        if alpha > 0.15:
-            weight = min(alpha * 3, 1.0)
-            texture_parts.append(f"smooth flowing melodies ({weight:.0%})")
+        # Gamma: sparkle
+        if gamma > 0.2:
+            modifiers.append("bright")
         
-        # Beta: structured, precise, rhythmic
-        if beta > 0.15:
-            weight = min(beta * 3, 1.0)
-            texture_parts.append(f"precise rhythmic patterns ({weight:.0%})")
+        # Take max 2 modifiers to keep prompt concise
+        modifier_str = ", ".join(modifiers[:2]) if modifiers else ""
         
-        # Gamma: sparkling, brilliant, complex
-        if gamma > 0.1:
-            weight = min(gamma * 4, 1.0)
-            texture_parts.append(f"sparkling shimmering details ({weight:.0%})")
-        
-        texture_str = ", ".join(texture_parts) if texture_parts else "balanced texture"
-        
-        # --- Space layer (relaxation vs focus) ---
-        if relaxation > 0.6:
-            space_str = "spacious, reverb-drenched, ethereal"
-        elif focus > 0.6:
-            space_str = "tight, focused, intimate"
-        else:
-            space_str = "natural room ambience"
-        
-        # --- Instrument layer (dominant band selects timbre) ---
-        bands = {'delta': delta, 'theta': theta, 'alpha': alpha, 'beta': beta, 'gamma': gamma}
-        dominant = max(bands, key=bands.get)
-        instrument_map = {
-            'delta': "contrabass, cello, sub-bass",
-            'theta': "hang drum, kalimba, celestial pads",
-            'alpha': "grand piano, nylon guitar, warm rhodes",
-            'beta': "marimba, vibraphone, electric guitar",
-            'gamma': "bells, chimes, harp, digital synths",
-        }
-        instruments = instrument_map.get(dominant, "piano")
-        
-        # Combine all layers
-        prompt = f"{energy_str}, {mood_str}, {texture_str}, {space_str}, {instruments}, instrumental, no vocals"
-        return prompt
+        if modifier_str:
+            return f"{genre}, {modifier_str}, instrumental"
+        return f"{genre}, instrumental"
     
     async def update(self, params: dict, prompts: list):
         """Actualizar estilo de Magenta con mapping continuo y transiciones suaves"""
@@ -422,55 +623,32 @@ class MusicGenerator:
         try:
             self.current_params = params
             
-            # --- Continuous parameter mapping (no thresholds) ---
-            delta = params.get('delta', 0.2)
-            theta = params.get('theta', 0.2)
-            alpha = params.get('alpha', 0.2)
-            beta = params.get('beta', 0.2)
-            gamma = params.get('gamma', 0.2)
+            # Use the continuous parameters from map_to_lyria
+            target_temp = params.get('temperature', 1.2)
+            target_guidance = params.get('guidance', 3.0)
             arousal = params.get('arousal_adjusted', params.get('arousal', 0.5))
-            relaxation = params.get('relaxation_adjusted', params.get('relaxation', 0.5))
-            focus = params.get('focus_adjusted', params.get('focus', 0.5))
             
-            # Amplify band differences: normalize each band relative to its running mean
-            # This makes small EEG fluctuations produce large musical changes
+            # Smooth interpolation — respond to brain changes gradually
+            blend = 0.3  # Slower than before for smoother transitions
+            self._gen_temperature = self._gen_temperature * (1 - blend) + target_temp * blend
+            self._gen_cfg_musiccoca = self._gen_cfg_musiccoca * (1 - blend) + target_guidance * blend
             
-            # Temperature: wide range, driven by theta/alpha contrast
-            # theta high = creative/unpredictable, alpha high = stable/consonant
-            # arousal adds energy, delta adds gravity
-            # Cap at 2.0 — higher values cause noise/silence from Magenta
-            theta_alpha_ratio = theta / (alpha + 0.01)
-            target_temp = np.clip(
-                0.5 + theta_alpha_ratio * 1.2 + arousal * 0.8 - delta * 0.4,
-                0.3, 2.0
-            )
+            # Top-k: derived from harmonic_complexity (more complexity = more variety)
+            hc = params.get('harmonic_complexity', 0.5)
+            target_top_k = int(np.clip(10 + hc * 40 + arousal * 10, 5, 50))
+            self._gen_top_k = int(self._gen_top_k * (1 - blend) + target_top_k * blend)
             
-            # Top-k: gamma/beta contrast drives variety vs precision
-            # Cap at 50 — higher values with high temp cause noise
-            gamma_beta_ratio = gamma / (beta + 0.01)
-            target_top_k = int(np.clip(
-                10 + gamma_beta_ratio * 30 + arousal * 20 - focus * 15,
-                5, 50
-            ))
-            
-            # Faster interpolation — respond to brain changes quickly
-            temp_blend = 0.5
-            self._gen_temperature = self._gen_temperature * (1 - temp_blend) + target_temp * temp_blend
-            self._gen_top_k = int(self._gen_top_k * (1 - temp_blend) + target_top_k * temp_blend)
-            
-            # CFG guidance: how strongly generation follows the style prompt.
-            # Default (3.0) is weak -> generic/flat sound. Focus+arousal push it
-            # up to 6.5 for punchier, more expressive adherence to the vibe.
-            target_cfg = np.clip(2.5 + focus * 2.5 + arousal * 2.0, 2.5, 6.5)
-            self._gen_cfg_musiccoca = self._gen_cfg_musiccoca * (1 - temp_blend) + target_cfg * temp_blend
-            
-            # Drums: always on to maintain rhythmic presence.
-            # None can cause Magenta to generate silence/ambient noise.
+            # Drums: always on
             self._gen_drums = [1]
             
             # --- Build vibe prompt and compute target style embedding ---
             vibe_prompt = self._build_vibe_prompt(params)
             self._vibe_history.append(vibe_prompt)
+            
+            # Skip re-embedding if prompt hasn't changed — saves CPU for generation
+            if vibe_prompt == self._last_vibe_prompt:
+                return
+            self._last_vibe_prompt = vibe_prompt
             
             # Compute target embedding in a background thread to avoid blocking audio.
             # Guarded by a lock since the underlying TFLite interpreters are not
@@ -511,50 +689,85 @@ class MusicGenerator:
             while self.is_generating:
                 t_start = time.time()
                 
-                with self._tflite_lock:
-                    waveform, self.state = self.mrt.generate(
-                        style=self.current_style_embedding,
-                        drums=self._gen_drums,
-                        frames=frames_per_step,
-                        state=self.state,
-                        temperature=self._gen_temperature,
-                        top_k=self._gen_top_k,
-                        cfg_musiccoca=self._gen_cfg_musiccoca
-                    )
+                waveform, self.state = self.mrt.generate(
+                    style=self.current_style_embedding,
+                    drums=self._gen_drums,
+                    frames=frames_per_step,
+                    state=self.state,
+                    temperature=self._gen_temperature,
+                    top_k=self._gen_top_k,
+                    cfg_musiccoca=self._gen_cfg_musiccoca,
+                )
                 
                 generation_time = time.time() - t_start
+                t_post = time.time()
                 realtime_ratio = step_duration / generation_time if generation_time > 0 else 0
+                
+                # Detect silence — only reset state after consecutive silent chunks
+                # to avoid micro-cuts from single quiet frames
+                samples_float = waveform.samples
+                rms = np.sqrt(np.mean(samples_float ** 2))
+                if rms < 0.005:  # Very quiet (normalized -1 to 1 range)
+                    self._silent_streak = getattr(self, '_silent_streak', 0) + 1
+                    if self._silent_streak >= 3:
+                        logger.warning(f"⚠️ {self._silent_streak} consecutive silent chunks (RMS={rms:.6f}), resetting state")
+                        self.state = None
+                        self._silent_streak = 0
+                    # Still send the chunk to maintain stream continuity (it's quiet, not absent)
+                else:
+                    self._silent_streak = 0
                 
                 samples_int16 = (waveform.samples * 32767.0).astype(np.int16)
                 chunk_data = samples_int16.tobytes()
                 
                 chunk_count += 1
                 self.audio_chunks.append(chunk_data)
+                # Limit memory: keep last 100 chunks for save-on-stop
+                if len(self.audio_chunks) > 100:
+                    self.audio_chunks = self.audio_chunks[-100:]
                 
                 if chunk_count % 50 == 0:
-                    logger.info(f"🎵 Chunk {chunk_count}: {generation_time:.2f}s gen / {step_duration:.1f}s audio (ratio {realtime_ratio:.2f}x) | temp={self._gen_temperature:.2f} top_k={self._gen_top_k} cfg={self._gen_cfg_musiccoca:.2f} drums={self._gen_drums}")
+                    total_loop = time.time() - t_start
+                    post_time = time.time() - t_post
+                    logger.info(f"🎵 Chunk {chunk_count}: {generation_time:.2f}s gen / {step_duration:.1f}s audio (ratio {realtime_ratio:.2f}x) | post={post_time:.2f}s total={total_loop:.2f}s | temp={self._gen_temperature:.2f} top_k={self._gen_top_k} cfg={self._gen_cfg_musiccoca:.2f} drums={self._gen_drums}")
                     
-                if self.audio_callback:
+                if self.audio_bin_callback:
+                    # Send raw binary — no base64, no JSON, 33% less data
+                    asyncio.ensure_future(self.audio_bin_callback(
+                        chunk_count, chunk_data, SAMPLE_RATE_AUDIO, CHANNELS
+                    ))
+                elif self.audio_callback:
                     audio_b64 = base64.b64encode(chunk_data).decode('utf-8')
-                    await self.audio_callback({
+                    asyncio.ensure_future(self.audio_callback({
                         'type': 'audio',
                         'data': audio_b64,
                         'sample_rate': SAMPLE_RATE_AUDIO,
                         'channels': CHANNELS,
                         'chunk_id': chunk_count,
-                    })
-                    
-                total_bytes = sum(len(c) for c in self.audio_chunks)
+                    }))
+                
+                # Track buffer progress without O(n) sum every iteration
+                self._total_bytes = getattr(self, '_total_bytes', 0) + len(chunk_data)
                 target_bytes = 20 * SAMPLE_RATE_AUDIO * CHANNELS * 2
-                self.buffer_progress = min(100, (total_bytes / target_bytes) * 100)
+                self.buffer_progress = min(100, (self._total_bytes / target_bytes) * 100)
                 if self.buffer_progress >= 100:
                     self.buffer_ready = True
                 
                 # If frontend says we have enough buffered, wait before generating more
+                # But auto-reset after 10s to prevent permanent stall if frontend disconnects
                 if self._throttled:
-                    await asyncio.sleep(0.5)
+                    if not hasattr(self, '_throttle_start'):
+                        self._throttle_start = time.time()
+                    if time.time() - self._throttle_start > 10:
+                        self._throttled = False
+                        delattr(self, '_throttle_start')
+                        logger.info("🔄 Throttle timeout — resuming generation")
+                    else:
+                        await asyncio.sleep(0.5)
                 else:
-                    await asyncio.sleep(0)
+                    if hasattr(self, '_throttle_start'):
+                        delattr(self, '_throttle_start')
+                    await asyncio.sleep(0)  # Minimal yield to let event loop process sends
                 
             logger.info(f"Bucle local finalizado. Total de chunks generados: {chunk_count}")
         except Exception as e:
@@ -1041,9 +1254,35 @@ DASHBOARD_HTML = """
                     </div>
                 </div>
                 
+                <div id="model-selector-div" style="margin-bottom:15px;">
+                    <label style="font-size:0.85em; opacity:0.7; display:block; margin-bottom:6px;">Model Size (Local)</label>
+                    <select id="model-select" style="width:100%; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#e6edf3; font-size:0.85em;">
+                        <option value="mrt2_small">⚡ Fast — mrt2_small (230M, ~2.3x realtime)</option>
+                        <option value="mrt2_base_fast">🚀 Base Fast — 4-bit + 1 CFG (~2x realtime, best quality/speed)</option>
+                        <option value="mrt2_base">🎨 Quality — mrt2_base (2.4B, ~0.7x realtime, cuts)</option>
+                    </select>
+                </div>
+                
                 <div class="music-controls">
                     <button class="btn-start" id="btn-start" onclick="startMusic()" disabled>▶️ Start Music</button>
                     <button class="btn-stop" id="btn-stop" onclick="stopMusic()" disabled>⏹️ Stop</button>
+                </div>
+                
+                <button class="btn-reset" id="btn-calibrate" onclick="startCalibration()" style="width:100%; margin-bottom:10px;">📊 Calibrate Baseline (10s)</button>
+                
+                <div style="margin-bottom:10px;">
+                    <label style="font-size:0.8em; opacity:0.7; display:block; margin-bottom:4px;">Genre Override</label>
+                    <select id="genre-select" onchange="setGenre(this.value)" style="width:100%; padding:8px; border-radius:8px; border:1px solid rgba(255,255,255,0.15); background:rgba(255,255,255,0.05); color:#e6edf3; font-size:0.85em;">
+                        <option value="">Auto (EEG-driven)</option>
+                        <option value="cool jazz, laid back, mellow trumpet, instrumental">Cool Jazz</option>
+                        <option value="experimental piano, prepared piano, extended techniques, classical">Experimental Piano</option>
+                        <option value="contemporary classical, strings and piano, orchestral">Classical</option>
+                        <option value="futuristic electronic, driving synth arpeggios, energetic">Futuristic Electronic</option>
+                        <option value="ambient, atmospheric pads, evolving textures">Ambient</option>
+                        <option value="bebop jazz, fast tempo, virtuosic saxophone, instrumental">Bebop</option>
+                        <option value="modal jazz, spacious, introspective piano, instrumental">Modal Jazz</option>
+                        <option value="lofi hip hop, dusty piano, vinyl crackle, chill">Lo-fi Hip Hop</option>
+                    </select>
                 </div>
                 
                 <button class="btn-reset" onclick="resetBaseline()" style="width:100%; margin-bottom:10px;">🔄 Reset Baseline</button>
@@ -1209,7 +1448,13 @@ DASHBOARD_HTML = """
                 setTimeout(connect, 2000);
             };
             
+            ws.binaryType = 'arraybuffer';
             ws.onmessage = (event) => {
+                // Binary frames = raw audio chunks (4-byte chunk_id + int16 samples)
+                if (event.data instanceof ArrayBuffer) {
+                    handleBinaryAudio(event.data);
+                    return;
+                }
                 const data = JSON.parse(event.data);
                 
                 if (data.type === 'eeg') {
@@ -1231,6 +1476,11 @@ DASHBOARD_HTML = """
                     addLog('🎵 Music started - buffering audio...', 'change');
                 } else if (data.type === 'muse_status') {
                     updateMuseStatus(data.connected);
+                } else if (data.type === 'calibration_done') {
+                    const btn = document.getElementById('btn-calibrate');
+                    btn.disabled = false;
+                    btn.textContent = data.success ? '📊 Recalibrate Baseline' : '📊 Calibrate Baseline (10s)';
+                    if (data.success) addLog('✅ Baseline captured!', 'change');
                 } else if (data.type === 'music_stopped') {
                     isGenerating = false;
                     stopAudio();
@@ -1351,12 +1601,14 @@ DASHBOARD_HTML = """
             selectedEngine = engine;
             document.getElementById('engine-local').style.background = engine === 'local' ? 'rgba(78,205,196,0.2)' : 'rgba(255,255,255,0.05)';
             document.getElementById('engine-online').style.background = engine === 'online' ? 'rgba(78,205,196,0.2)' : 'rgba(255,255,255,0.05)';
+            document.getElementById('model-selector-div').style.display = engine === 'local' ? 'block' : 'none';
             addLog('Engine: ' + (engine === 'local' ? 'Local (Magenta)' : 'Online (Lyria)'));
         }
         
         function startMusic() {
-            ws.send(JSON.stringify({ action: 'start_music', engine: selectedEngine }));
-            addLog('Starting music generation...');
+            const modelSize = document.getElementById('model-select') ? document.getElementById('model-select').value : 'mrt2_small';
+            ws.send(JSON.stringify({ action: 'start_music', engine: selectedEngine, model_size: modelSize }));
+            addLog(`Starting music generation... (${selectedEngine}${selectedEngine === 'local' ? ', ' + modelSize : ''})`);
         }
         
         function stopMusic() {
@@ -1367,6 +1619,23 @@ DASHBOARD_HTML = """
         function resetBaseline() {
             ws.send(JSON.stringify({ action: 'reset_baseline' }));
             addLog('🔄 Resetting baseline...', 'change');
+        }
+        
+        function startCalibration() {
+            const btn = document.getElementById('btn-calibrate');
+            btn.disabled = true;
+            btn.textContent = '📊 Calibrating...';
+            ws.send(JSON.stringify({ action: 'calibrate' }));
+            addLog('📊 Calibrating baseline — stay still and relaxed for 10s...', 'change');
+        }
+        
+        function setGenre(value) {
+            ws.send(JSON.stringify({ action: 'set_genre', genre: value }));
+            if (value) {
+                addLog(`🎵 Genre override: ${value}`, 'change');
+            } else {
+                addLog('🎵 Genre: Auto (EEG-driven)', 'change');
+            }
         }
         
         let museStreamRunning = false;
@@ -1475,7 +1744,7 @@ DASHBOARD_HTML = """
         let audioQueue = [];
         let isPlaying = false;
         let nextPlayTime = 0;
-        const BUFFER_SECONDS = 6; // Buffer before starting playback
+        const BUFFER_SECONDS = 30; // Pre-buffer before playback (30s = enough headroom for jitter)
         let totalBufferedSeconds = 0;
         let playbackStarted = false;
         let chunkCount = 0;
@@ -1496,7 +1765,7 @@ DASHBOARD_HTML = """
             }
         }
         
-        function handleAudioChunk(data) {
+        function handleBinaryAudio(arrayBuffer) {
             if (!audioContext) initAudio();
             
             const now = performance.now();
@@ -1504,19 +1773,8 @@ DASHBOARD_HTML = """
             const interChunkMs = lastChunkTime > 0 ? (now - lastChunkTime).toFixed(0) : '-';
             lastChunkTime = now;
             
-            // Fast base64 decode: use atob + Uint8Array from char codes in chunks
-            const binaryString = atob(data.data);
-            const len = binaryString.length;
-            const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i += 8192) {
-                const end = Math.min(i + 8192, len);
-                for (let j = i; j < end; j++) {
-                    bytes[j] = binaryString.charCodeAt(j);
-                }
-            }
-            
-            // Convert Int16 PCM to Float32 stereo using DataView (fast, no intermediate array)
-            const int16View = new Int16Array(bytes.buffer);
+            // Skip 4-byte header (chunk_id), rest is Int16 stereo PCM
+            const int16View = new Int16Array(arrayBuffer, 4);
             const numSamples = int16View.length / 2;
             const audioBuffer = audioContext.createBuffer(2, numSamples, 48000);
             const leftChannel = audioBuffer.getChannelData(0);
@@ -1541,8 +1799,15 @@ DASHBOARD_HTML = """
             if (!playbackStarted && totalBufferedSeconds >= BUFFER_SECONDS) {
                 playbackStarted = true;
                 nextPlayTime = audioContext.currentTime + 0.1;
-                addLog('🔊 Playback started!', 'change');
+                addLog(`🔊 Playback started! (buffer: ${totalBufferedSeconds.toFixed(1)}s)`, 'change');
                 if (AUDIO_DEBUG) console.log(`[AUDIO] === PLAYBACK STARTED === queue=${audioQueue.length} buffered=${totalBufferedSeconds.toFixed(1)}s`);
+            } else if (!playbackStarted) {
+                // Show buffering progress
+                const pct = Math.min(100, (totalBufferedSeconds / BUFFER_SECONDS * 100).toFixed(0));
+                const bufStatus = document.getElementById('buffer-status');
+                if (bufStatus) bufStatus.textContent = `${pct}% (buffering ${totalBufferedSeconds.toFixed(1)}s/${BUFFER_SECONDS}s)`;
+                const bufBar = document.getElementById('buffer-bar');
+                if (bufBar) bufBar.style.width = pct + '%';
             }
             
             // Always ensure scheduler is running when we have audio
@@ -1568,36 +1833,23 @@ DASHBOARD_HTML = """
                 const gapSec = (audioContext.currentTime - nextPlayTime).toFixed(3);
                 gapCount++;
             if (AUDIO_DEBUG) console.warn(`[AUDIO] ⚠️ GAP #${gapCount} detected! nextPlayTime was ${gapSec}s behind currentTime. Resetting. queue=${audioQueue.length}`);
-                nextPlayTime = audioContext.currentTime + 0.05;
+                nextPlayTime = audioContext.currentTime + 0.02;
             }
-            // Schedule up to 3s ahead for low latency
+            // Schedule only 3s ahead — keep rest in queue as jitter buffer
             const LOOKAHEAD = 3.0;
-            const CROSSFADE_MS = 10;
-            const crossfadeTime = CROSSFADE_MS / 1000;
             let scheduledThisRun = 0;
             while (audioQueue.length > 0 && nextPlayTime < audioContext.currentTime + LOOKAHEAD) {
                 const buffer = audioQueue.shift();
                 const source = audioContext.createBufferSource();
                 source.buffer = buffer;
                 
-                // Crossfade: fade-in at start, fade-out at end
-                const gain = audioContext.createGain();
-                const startTime = nextPlayTime;
-                const endTime = startTime + buffer.duration;
-                
-                gain.gain.setValueAtTime(0, startTime);
-                gain.gain.linearRampToValueAtTime(1, startTime + crossfadeTime);
-                gain.gain.setValueAtTime(1, endTime - crossfadeTime);
-                gain.gain.linearRampToValueAtTime(0, endTime);
-                
-                source.connect(gain);
-                gain.connect(audioContext.destination);
-                source.start(startTime);
+                // No crossfade — model streaming state ensures seamless continuity
+                source.connect(audioContext.destination);
+                source.start(nextPlayTime);
                 source.onended = function() {
-                    gain.disconnect();
                     source.disconnect();
                 };
-                nextPlayTime = endTime - crossfadeTime;
+                nextPlayTime = nextPlayTime + buffer.duration;
                 scheduledThisRun++;
             }
             if (AUDIO_DEBUG && scheduledThisRun > 0 && chunkCount % 10 === 0) {
@@ -1606,11 +1858,11 @@ DASHBOARD_HTML = """
             }
             // Throttle backend: tell it to pause if queue is large, resume if small
             if (ws && ws.readyState === 1) {
-                if (audioQueue.length > 10 && !backendThrottled) {
+                if (audioQueue.length > 40 && !backendThrottled) {
                     backendThrottled = true;
                     ws.send(JSON.stringify({ action: 'throttle', throttled: true }));
                 if (AUDIO_DEBUG) console.log('[THROTTLE] telling backend to PAUSE generation');
-                } else if (audioQueue.length < 5 && backendThrottled) {
+                } else if (audioQueue.length < 15 && backendThrottled) {
                     backendThrottled = false;
                     ws.send(JSON.stringify({ action: 'throttle', throttled: false }));
                 if (AUDIO_DEBUG) console.log('[THROTTLE] telling backend to RESUME generation');
@@ -1634,7 +1886,7 @@ DASHBOARD_HTML = """
                     return;
                 }
                 scheduleBuffers();
-            }, 50);
+            }, 25);
         }
         
         // Report stats to backend every 3s for monitoring
@@ -1714,9 +1966,10 @@ async def run_dashboard_server():
     processor = EEGProcessor(sensitivity=2.5)
     state = {
         'music_gen': None,
-        'music_gen_local': None,
+        'music_gen_local': None,  # cached by model size
         'music_gen_online': None,
         'current_engine': None,
+        'local_model_size': 'mrt2_small',  # default model for local engine
     }
     
     # Conectar MUSE (inicial, pero se reconecta dinámicamente después)
@@ -1766,6 +2019,25 @@ async def run_dashboard_server():
                 t.add_done_callback(_pending_sends.discard)
             await asyncio.sleep(0)
     
+    async def broadcast_audio(chunk_id, raw_bytes, sample_rate, channels):
+        """Send audio as binary WebSocket frame — much faster than base64+JSON"""
+        if connected_clients:
+            # Build a binary message: 4-byte header (chunk_id as uint32) + raw audio bytes
+            import struct
+            header = struct.pack('<I', chunk_id)  # 4 bytes little-endian
+            payload = header + raw_bytes
+            tasks = [asyncio.ensure_future(_safe_send_bin(client, payload)) for client in connected_clients]
+            for t in tasks:
+                _pending_sends.add(t)
+                t.add_done_callback(_pending_sends.discard)
+            await asyncio.sleep(0)
+    
+    async def _safe_send_bin(client, payload):
+        try:
+            await client.send(payload)
+        except Exception:
+            pass
+    
     async def reconnect_muse():
         """Busca MUSE periódicamente si no hay conexión activa"""
         from pylsl import StreamInlet, resolve_byprop
@@ -1777,10 +2049,17 @@ async def run_dashboard_server():
                     logger.info("🔄 Buscando stream MUSE...")
                     streams = resolve_byprop('type', 'EEG', timeout=3)
                     if streams:
-                        eeg_state['inlet'] = StreamInlet(streams[0])
-                        logger.info(f"✅ MUSE conectado: {streams[0].name()}")
-                        await broadcast({'type': 'log', 'message': 'MUSE EEG conectado', 'level': 'change'})
-                        await send_muse_status(True)
+                        inlet = StreamInlet(streams[0])
+                        # Verify actual data is flowing before marking as connected
+                        sample, _ = inlet.pull_sample(timeout=2.0)
+                        if sample is not None and any(abs(v) > 0.1 for v in sample):
+                            eeg_state['inlet'] = inlet
+                            logger.info(f"✅ MUSE conectado: {streams[0].name()}")
+                            await broadcast({'type': 'log', 'message': 'MUSE EEG conectado', 'level': 'change'})
+                            await send_muse_status(True)
+                        else:
+                            logger.warning("⚠️ Stream found but no data flowing — is Muse on?")
+                            await send_muse_status(False)
                     else:
                         logger.info("⏳ MUSE no detectado, reintentando en 3s...")
                 except Exception as e:
@@ -1831,6 +2110,11 @@ async def run_dashboard_server():
                         if len(eeg_buffer) >= WINDOW_SIZE:
                             eeg_data = np.array(eeg_buffer).T
                             bands = processor.extract_bands(eeg_data)
+                            
+                            # Feed calibration if active
+                            if processor._calibrating:
+                                processor.feed_calibration(bands)
+                            
                             metrics = processor.calculate_metrics(bands)
                             music_params = processor.map_to_lyria(bands, metrics)
                             prompts = processor.generate_prompts(music_params)
@@ -1861,7 +2145,7 @@ async def run_dashboard_server():
                             # Actualizar música si está generando
                             now = time.time()
                             mg = state['music_gen']
-                            if mg and mg.is_generating and now - last_update >= 3.0:
+                            if mg and mg.is_generating and now - last_update >= 6.0:
                                 last_update = now
                                 await mg.update(music_params, prompts)
                                 
@@ -1903,13 +2187,18 @@ async def run_dashboard_server():
                                     continue
                             state['music_gen'] = state['music_gen_online']
                         else:
-                            if state['music_gen_local'] is None:
-                                state['music_gen_local'] = MusicGenerator()
+                            model_size = cmd.get('model_size', state.get('local_model_size', 'mrt2_small'))
+                            state['local_model_size'] = model_size
+                            # Reuse cached instance only if same model size
+                            cached = state.get('music_gen_local')
+                            if cached is None or cached.model_size != model_size:
+                                state['music_gen_local'] = MusicGenerator(model_size=model_size)
                             state['music_gen'] = state['music_gen_local']
                         
                         state['current_engine'] = engine
                         mg = state['music_gen']
-                        mg.audio_callback = broadcast_fire
+                        mg.audio_callback = broadcast_fire  # for metadata messages
+                        mg.audio_bin_callback = broadcast_audio  # for binary audio
                         success = await mg.start()
                         if success:
                             audio_task = asyncio.create_task(mg.receive_audio())
@@ -1929,6 +2218,31 @@ async def run_dashboard_server():
                     elif action == 'reset_baseline':
                         processor.reset_baseline()
                         await broadcast({'type': 'log', 'message': 'Baseline reset', 'level': 'change'})
+                    
+                    elif action == 'set_genre':
+                        genre = cmd.get('genre', '')
+                        if genre:
+                            processor._manual_genre = genre
+                            await broadcast({'type': 'log', 'message': f'🎵 Genre override: {genre}', 'level': 'change'})
+                        else:
+                            processor._manual_genre = None
+                            await broadcast({'type': 'log', 'message': '🎵 Genre: Auto (EEG-driven)', 'level': 'change'})
+                    
+                    elif action == 'calibrate':
+                        processor.start_calibration()
+                        await broadcast({'type': 'log', 'message': '📊 Calibration started — stay relaxed for 10s', 'level': 'change'})
+                        # Auto-finish after 10s
+                        async def _finish_cal():
+                            await asyncio.sleep(10)
+                            if processor._calibrating:
+                                success = processor.finish_calibration()
+                                if success:
+                                    await broadcast({'type': 'log', 'message': f'✅ Baseline captured: {processor._band_baseline}', 'level': 'change'})
+                                    await broadcast({'type': 'log', 'message': 'Music will now react to YOUR deviations from baseline', 'level': 'change'})
+                                else:
+                                    await broadcast({'type': 'log', 'message': '⚠️ Calibration failed — not enough data', 'level': 'error'})
+                                await broadcast({'type': 'calibration_done', 'success': success})
+                        asyncio.create_task(_finish_cal())
                     
                     elif action == 'start_muse':
                         import subprocess
@@ -1956,12 +2270,19 @@ async def run_dashboard_server():
                                     break
                                 streams = _resolve('type', 'EEG', timeout=1)
                                 if streams:
-                                    eeg_state['inlet'] = StreamInlet(streams[0])
-                                    lsl_found = True
-                                    logger.info(f"✅ MUSE LSL stream detected after muselsl start")
-                                    await broadcast({'type': 'log', 'message': '✅ Muse connected via LSL', 'level': 'change'})
-                                    await send_muse_status(True)
-                                    break
+                                    inlet = StreamInlet(streams[0])
+                                    # Verify actual data flows before marking connected
+                                    sample, _ = inlet.pull_sample(timeout=2.0)
+                                    if sample is not None and any(abs(v) > 0.1 for v in sample):
+                                        eeg_state['inlet'] = inlet
+                                        lsl_found = True
+                                        logger.info(f"✅ MUSE LSL stream detected with live data")
+                                        await broadcast({'type': 'log', 'message': '✅ Muse connected via LSL', 'level': 'change'})
+                                        await send_muse_status(True)
+                                        break
+                                    else:
+                                        logger.warning("⚠️ LSL stream found but no data — is Muse on?")
+                                        await send_muse_status(False)
                             
                             if not lsl_found and proc.poll() is None:
                                 await broadcast({'type': 'log', 'message': '⏳ muselsl running but no LSL stream yet. Check Bluetooth pairing.', 'level': 'error'})
